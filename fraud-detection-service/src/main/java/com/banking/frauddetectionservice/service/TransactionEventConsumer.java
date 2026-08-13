@@ -17,7 +17,7 @@ public class TransactionEventConsumer {
 
     /**
      * Listens to transaction.initiated topic.
-     * Every transaction goes through fraud check be fore completing.
+     * Every transaction goes through fraud check before completing.
      */
     @KafkaListener(
             topics = "transaction.initiated",

@@ -22,11 +22,12 @@ import java.util.concurrent.TimeUnit;
 public class TransactionEventConsumer {
 
     private final TransactionRepository transactionRepository;
-    private final RedisTemplate<String, String> redisTemplate;
     private final TransactionService transactionService;
+    
     private static final long OTP_EXPIRY_MINUTES = 5;
 
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final RedisTemplate<String, String> redisTemplate;
 
     private static final String TRANSACTION_OTP_GENERATED_TOPIC = "transaction.otp.generated";
 
