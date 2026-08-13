@@ -31,6 +31,7 @@ public class AccountService {
     public AccountResponse createAccount(CreateAccountRequest request) {
         log.info("Creating account for: {}", request.getEmail());
 
+        // but in real banking system phone number will be used to check
         if (accountRepository.existsByEmail(request.getEmail())) {
             throw new RuntimeException("Account already exists for email: "
                     + request.getEmail());
