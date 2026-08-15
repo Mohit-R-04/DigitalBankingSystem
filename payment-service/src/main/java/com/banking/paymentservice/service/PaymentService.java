@@ -1,5 +1,6 @@
 package com.banking.paymentservice.service;
 
+import com.banking.paymentservice.client.AccountServiceClient;
 import com.banking.paymentservice.dto.CreatePaymentRequest;
 import com.banking.paymentservice.dto.PaymentOrderResponse;
 import com.banking.paymentservice.model.Payment;
@@ -27,6 +28,7 @@ public class PaymentService {
 
     private final PaymentRepository paymentRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final AccountServiceClient accountServiceClient;
 
     @Value("${razorpay.key-id}")
     private String keyId;
@@ -107,7 +109,15 @@ public class PaymentService {
             payment.setStatus(PaymentStatus.COMPLETED);
             paymentRepository.save(payment);
 
-            // Publish payment completed event
+            // Credit the user's account balance
+            log.info("Crediting ₹{} to account: {}",
+                    payment.getAmount(), payment.getAccountNumber());
+            accountServiceClient.creditBalance(
+                    payment.getAccountNumber(),
+                    payment.getAmount());
+            log.info("Account credited successfully");
+
+            // Publish payment completed event (for notification)
             Map<String, Object> event = new HashMap<>();
             event.put("paymentId", payment.getId());
             event.put("accountNumber", payment.getAccountNumber());
