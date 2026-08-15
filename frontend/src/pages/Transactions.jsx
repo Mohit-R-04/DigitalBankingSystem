@@ -30,7 +30,7 @@ export default function Transactions() {
     <div className="space-y-5 sm:space-y-6">
       <div className="flex items-center space-x-3">
         <History className="h-7 w-7 sm:h-8 sm:w-8 text-indigo-600" />
-        <h2 className="text-xl sm:text-2xl font-bold text-gray-900">Transaction History</h2>
+        <h2 className="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Transaction History</h2>
       </div>
 
       <div className="card p-4 sm:p-6">
@@ -45,19 +45,19 @@ export default function Transactions() {
 
       {searched && transactions.length === 0 && (
         <div className="card p-8 sm:p-12 text-center">
-          <Clock className="h-10 w-10 sm:h-12 sm:w-12 text-gray-300 mx-auto mb-3" />
-          <p className="text-gray-500 text-sm sm:text-base">No transactions found for this account</p>
+          <Clock className="h-10 w-10 sm:h-12 sm:w-12 text-gray-300 dark:text-gray-600 mx-auto mb-3" />
+          <p className="text-gray-500 dark:text-gray-400 dark:text-gray-500 text-sm sm:text-base">No transactions found for this account</p>
         </div>
       )}
 
       {transactions.length > 0 && (
         <div className="card overflow-hidden">
-          <div className="px-4 sm:px-6 py-3 sm:py-4 border-b border-gray-200">
-            <p className="text-xs sm:text-sm text-gray-500">{transactions.length} transaction(s) found</p>
+          <div className="px-4 sm:px-6 py-3 sm:py-4 border-b border-gray-200 dark:border-gray-700">
+            <p className="text-xs sm:text-sm text-gray-500 dark:text-gray-400 dark:text-gray-500">{transactions.length} transaction(s) found</p>
           </div>
           <div className="divide-y divide-gray-100">
             {transactions.map((txn) => (
-              <div key={txn.id} className="px-4 sm:px-6 py-3 sm:py-4 hover:bg-gray-50 transition-colors">
+              <div key={txn.id} className="px-4 sm:px-6 py-3 sm:py-4 hover:bg-gray-50 dark:hover:bg-gray-700 dark:bg-gray-700 transition-colors">
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center space-x-3 min-w-0">
                     {txn.senderAccountNumber === accountNumber ? (
@@ -70,14 +70,14 @@ export default function Transactions() {
                       </div>
                     )}
                     <div className="min-w-0">
-                      <p className="font-medium text-gray-900 text-sm sm:text-base truncate">
+                      <p className="font-medium text-gray-900 dark:text-white text-sm sm:text-base truncate">
                         {txn.senderAccountNumber === accountNumber ? 'Sent to' : 'Received from'}{' '}
                         <span className="font-mono text-xs sm:text-sm">
                           {txn.senderAccountNumber === accountNumber ? txn.receiverAccountNumber : txn.senderAccountNumber}
                         </span>
                       </p>
-                      <p className="text-xs sm:text-sm text-gray-500 truncate">{txn.description || 'No description'}</p>
-                      <p className="text-xs text-gray-400 font-mono mt-0.5 hidden sm:block">ID: {txn.id}</p>
+                      <p className="text-xs sm:text-sm text-gray-500 dark:text-gray-400 dark:text-gray-500 truncate">{txn.description || 'No description'}</p>
+                      <p className="text-xs text-gray-400 dark:text-gray-500 font-mono mt-0.5 hidden sm:block">ID: {txn.id}</p>
                     </div>
                   </div>
                   <div className="text-right shrink-0">
@@ -85,7 +85,7 @@ export default function Transactions() {
                       {txn.senderAccountNumber === accountNumber ? '-' : '+'}₹{Number(txn.amount).toLocaleString('en-IN')}
                     </p>
                     <StatusBadge status={txn.status} />
-                    <p className="text-xs text-gray-400 mt-1 hidden sm:block">{formatDateTime(txn.createdAt)}</p>
+                    <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 hidden sm:block">{formatDateTime(txn.createdAt)}</p>
                   </div>
                 </div>
                 {txn.failureReason && (
