@@ -1,0 +1,644 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{primary}{RGB}{79,70,229}
+\definecolor{success}{RGB}{22,163,74}
+\definecolor{warning}{RGB}{217,119,6}
+\definecolor{danger}{RGB}{220,38,38}
+
+\lstset{
+  backgroundcolor=\color{codebg},
+  frame=single,
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  language=Java,
+  keywordstyle=\color{primary}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{danger},
+}
+
+\title{\textbf{Digital Banking System\\Complete Working Documentation}}
+\author{Microservices Architecture with SAGA Pattern}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+%========================================================================
+\section{System Architecture Overview}
+%========================================================================
+
+The Digital Banking System consists of 6 independent Spring Boot microservices
+communicating through an API Gateway (synchronous REST via Feign) and Apache
+Kafka (asynchronous events). All services are stateless and share no databases;
+each service owns its own MySQL schema.
+
+\begin{description}
+  \item[API Gateway (8080)] Entry point for all client requests. Handles rate
+  limiting (Redis-backed) and routes to the correct service.
+  \item[Account Service (8081)] Owns account data in \texttt{account\_db}.
+  Handles account creation, balance queries, debit/credit, blocking.
+  \item[Transaction Service (8082)] Owns transfers in \texttt{transaction\_db}.
+  Orchestrates the SAGA flow for money transfers and OTP verification.
+  \item[Payment Service (8083)] Owns payments in \texttt{payment\_db}.
+  Integrates with Razorpay for deposits/withdrawals.
+  \item[Fraud Detection Service (8084)] Stateless. Consumes Kafka transactions,
+  runs fraud checks using Redis, publishes results back.
+  \item[Notification Service (8085)] Stateless. Consumes Kafka events and sends
+  alerts (simulated via console logs).
+\end{description}
+
+\subsection{Communication Model}
+\begin{itemize}
+  \item \textbf{Synchronous (REST via Feign):} deduct balance, credit balance,
+  refund, get balance, account queries.
+  \item \textbf{Asynchronous (Kafka):} fraud checks, transaction completion,
+  account blocking, OTP generation, all notifications.
+  \item \textbf{Storage:} MySQL (persistent data), Redis (OTP, fraud counters,
+  rate limiting).
+\end{itemize}
+
+\section{Infrastructure Components}
+
+\subsection{Docker Containers}
+\begin{lstlisting}[language={}]
+Container  Image                              Port(s)       Purpose
+--------   -----                              ------       -------
+mysql      mysql:8.0                          3306         Primary database (3 DBs)
+redis      redis:latest                       6379         Caching, fraud counters, OTP
+kafka      confluentinc/cp-kafka:7.6.0        9092         Message broker (KRaft mode)
+
+\textbf{Note:} Kafka 7.6.0 runs in KRaft mode --- no Zookeeper required.
+
+\subsection{Databases in MySQL}
+\begin{lstlisting}[language={}]
+Database           Tables (auto-created by JPA)
+--------           ---------------------------------
+account_db         accounts
+transaction_db     transactions
+payment_db         payments
+
+%========================================================================
+\section{Synchronous vs Asynchronous Communication}
+%========================================================================
+
+\begin{longtable}{p{3.5cm} p{3.5cm} p{8cm}}
+\toprule
+\textbf{Operation} & \textbf{Type} & \textbf{Why}\\
+\midrule
+\endhead
+Create Account & Sync (REST) & Immediate response needed\\
+Get Account / Balance & Sync (REST) & Query operation\\
+Deduct Balance (SAGA Step 1) & Sync (REST/Feign) & Must confirm before proceeding\\
+Refund (Compensation) & Sync (REST/Feign) & Must confirm money returned before marking status\\
+Credit (Payment webhook) & Sync (REST/Feign) & Money credited before notification\\
+Fraud Check & Async (Kafka) & Background processing\\
+Credit Receiver & Async (Kafka) & Transaction already marked completed\\
+Block Account & Async (Kafka) & Fire-and-forget, no one waits\\
+OTP Generation & Async (Kafka) & Background processing\\
+Notifications & Async (Kafka) & Fire-and-forget\\
+\bottomrule
+\end{longtable}
+\section{All REST Endpoints}
+
+\subsection{API Gateway Routes (Port 8080)}
+
+\begin{longtable}{p{6.5cm} p{4cm} p{4cm}}
+\toprule
+\textbf{Path Pattern} & \textbf{Routes To} & \textbf{Rate Limit}\\
+\midrule
+\endhead
+/api/v1/accounts/** & localhost:8081 (account-service) & 10 rps / burst 20\\
+/api/v1/transactions/** & localhost:8082 (transaction-service) & 10 rps / burst 20\\
+/api/v1/payments/** & localhost:8083 (payment-service) & 5 rps / burst 10\\
+\bottomrule
+\end{longtable}
+
+\subsection{Account Service Endpoints (Port 8081)}
+
+\begin{lstlisting}[language={}]
+POST /api/v1/accounts                     Create new bank account
+GET  /api/v1/accounts/{accountNumber}     Get account details
+GET  /api/v1/accounts/{accountNumber}/balance    Get balance
+PUT  /api/v1/accounts/{accountNumber}/block      Block account
+PUT  /api/v1/accounts/{accountNumber}/deduct     Deduct balance (SAGA)
+PUT  /api/v1/accounts/{accountNumber}/credit     Credit balance
+
+\subsubsection{POST /api/v1/accounts --- Create Account}
+\begin{lstlisting}[language={}]
+Request body:
+{
+  "accountHolderName": "Mohit Reddy",
+  "email": "mohit@test.com",
+  "phone": "9876543210",
+  "accountType": "SAVINGS",        // SAVINGS | CURRENT | FIXED_DEPOSIT
+  "initialDeposit": 50000
+}
+
+Response (201 Created):
+{
+  "id": "de6556e5-...",
+  "accountNumber": "378669440034",
+  "accountHolderName": "Mohit Reddy",
+  "accountType": "SAVINGS",
+  "status": "ACTIVE",
+  "balance": 50000.00,
+  "dailyTransactionLimit": 100000.00,   // SAVINGS=1L, CURRENT/FD=5L
+  ...
+}
+
+\textbf{Flow:}
+\begin{enumerate}
+  \item Gateway validates path and rate limit
+  \item Controller calls \texttt{accountService.createAccount()}
+  \item Service checks \texttt{existsByEmail()} --- if exists, throws Runtime\-Exception (handled by \texttt{GlobalExceptionHandler} $\rightarrow$ 400)
+  \item Generates unique 12-digit account number via \texttt{SecureRandom}
+  \item Sets daily limit based on account type (SAVINGS=1L, else 5L)
+  \item Saves to MySQL (\texttt{account\_db.accounts})
+\end{enumerate}
+
+\subsubsection{GET /api/v1/accounts/\{accountNumber\}}
+\textbf{Flow:} Gateway $\rightarrow$ AccountController $\rightarrow$ \texttt{findByAccountNumber()} $\rightarrow$ MySQL. If not found $\rightarrow$ Runtime\-Exception $\rightarrow$ GlobalExceptionHandler $\rightarrow$ 404.
+
+\subsubsection{PUT /api/v1/accounts/\{accountNumber\}/deduct}
+Called by Transaction Service (Feign client). Checks status is ACTIVE and balance sufficient, then subtracts amount. If insufficient $\rightarrow$ Runtime\-Exception $\rightarrow$ 500 (Feign error propagated to caller).
+
+\subsubsection{PUT /api/v1/accounts/\{accountNumber\}/credit}
+Called by Transaction Service (refund) and Payment Service (webhook credit). Adds amount to balance.
+
+%========================================================================
+\section{Transaction Flow --- SAGA Pattern (Core)}
+%========================================================================
+
+\subsection{POST /api/v1/transactions/transfer}
+
+\textbf{Request:}
+\begin{lstlisting}[language={}]
+{
+  "senderAccountNumber": "378669440034",
+  "receiverAccountNumber": "959032407792",
+  "amount": 5000,
+  "description": "Rent payment"
+}
+
+\subsection{Complete Transfer Flow (Happy Path)}
+
+\begin{lstlisting}[language={},basicstyle=\ttfamily\footnotesize]
+  Step  : Action                     Type        Actor
+  ----- : -------------------------- ----------- --------------------------
+  1     : POST /transfer             Sync (HTTP) Client -> Transaction Svc
+  2     : deductBalance(sender,amt)  Sync (REST) Transaction -> Account Svc
+  3     : Save transaction           Sync (JPA)  Transaction Svc -> MySQL
+           status = PROCESSING
+  4     : publish transaction.       Async       Transaction Svc -> Kafka
+           initiated
+  5     : consume & fraud check      Async       Fraud Detection Svc
+  6a    : publish fraud.check.clean  Async       Fraud Svc -> Kafka
+  6b    : publish verification.      Async       Fraud Svc -> Kafka
+           required (if suspicious)
+  7     : processCleanResult()       Async       Transaction Svc (consumer)
+  8     : completeTransaction()      Sync (JPA)  Transaction Svc -> MySQL
+           status = COMPLETED
+  9     : publish transaction.       Async       Transaction Svc -> Kafka
+           completed
+  10    : creditBalance(receiver)    Async       Account Svc (consumer)
+
+\subsection{Flow Diagram (Text Description)}
+The complete SAGA transfer flow is described below as sequential steps.
+
+\textbf{Normal (clean) transfer flow:}
+\begin{enumerate}
+  \item Client calls \texttt{POST /api/v1/transactions/transfer} with sender, receiver, amount.
+  \item Transaction Service synchronously calls Account Service to deduct the sender's balance (Feign).
+  \item Transaction Service saves the transaction with status \texttt{PROCESSING}.
+  \item Transaction Service publishes \texttt{transaction.initiated} to Kafka.
+  \item Fraud Detection Service consumes the event and runs three checks
+  (velocity via Redis INCR, amount via Redis average, balance via Feign).
+  \item If clean, Fraud Detection publishes \texttt{fraud.check.clean} to Kafka.
+  \item Transaction Service consumes it and calls \texttt{processCleanResult()}, marking status \texttt{COMPLETED}.
+  \item Transaction Service publishes \texttt{transaction.completed}.
+  \item Account Service consumes it and asynchronously credits the receiver's balance.
+  \item Notification Service consumes it and sends debit/credit alerts.
+\end{enumerate}
+
+\textbf{Suspicious (OTP verification) flow:}
+\begin{enumerate}
+  \item Steps 1--5 same as above, but Fraud Detection detects suspicious activity.
+  \item Fraud Detection publishes \texttt{verification.required} to Kafka.
+  \item Transaction Service consumes it, generates a 6-digit OTP, stores it in Redis
+  (\texttt{verification:otp<txnId>}, 5-min TTL), sets status \texttt{PENDING\_VERIFICATION}.
+  \item Transaction Service publishes \texttt{transaction.otp.generated} (Notification alerts user with OTP).
+  \item Client calls \texttt{POST /{transactionId}/verify?otp=...}.
+  \item If OTP correct, transaction completes and receiver is credited (same as steps 8--10 above).
+  \item If OTP wrong or expired, the SAGA compensates: sender is refunded synchronously
+  and the account may be blocked (see compensation section).
+\end{enumerate}
+
+\subsection{SAGA Compensation (Failure Path)}
+When a transaction fails (wrong OTP or expired OTP), the SAGA compensates:
+\begin{enumerate}
+  \item Money already deducted from the sender in step 2 is refunded synchronously via
+  Feign \texttt{creditBalance(sender, amount)}.
+  \item Transaction status is set to \texttt{FLAGGED} with a failure reason.
+  \item If OTP was wrong (possible fraud), \texttt{fraud.detected} is published so the
+  Account Service blocks the account and Notification alerts the user.
+  \item \texttt{transaction.refunded} is published so Notification informs the user
+  the refund was processed.
+\end{enumerate}
+
+\subsection{OTP Verification Endpoint}
+\textbf{POST /api/v1/transactions/\{transactionId\}/verify?otp=123456}
+
+\begin{enumerate}
+  \item Transaction Service finds transaction
+  \item Reads OTP from Redis: \texttt{redis.get("verification:otp<txnId>")}
+  \item \textbf{OTP null (expired):} compensateTransaction --- refund via Feign (SYNC), status=FLAGGED, publish \texttt{transaction.refunded}
+  \item \textbf{OTP wrong:} blockAccountAndCompensate --- publish \texttt{fraud.detected} (async, blocks account), then refund via Feign (SYNC), status=FLAGGED
+  \item \textbf{OTP correct:} delete Redis key, \texttt{completeTransaction()} --- status=COMPLETED, publish \texttt{transaction.completed}
+\end{enumerate}
+
+%========================================================================
+\section{Kafka Topics --- Complete Matrix}
+%========================================================================
+
+\begin{longtable}{p{3.8cm} p{4cm} p{4.2cm} p{3cm}}
+\toprule
+\textbf{Topic} & \textbf{Producer} & \textbf{Consumer} & \textbf{Purpose}\\
+\midrule
+\endhead
+transaction.initiated & Transaction Svc & Fraud Detection Svc & Start fraud check\\
+verification.required & Fraud Detection & Transaction Svc & Suspicious - request OTP\\
+fraud.check.clean & Fraud Detection & Transaction Svc & Clean - complete txn\\
+transaction.otp.generated & Transaction Svc & Notification Svc & Send OTP alert\\
+transaction.completed & Transaction Svc & Account Svc, Notification Svc & Credit receiver, alert\\
+transaction.refunded & Transaction Svc & Notification Svc & Refund alert\\
+fraud.detected & Transaction Svc & Account Svc, Notification Svc & Block account, alert\\
+payment.completed & Payment Svc & Notification Svc & Payment success alert\\
+payment.failed & Payment Svc & Notification Svc & Payment failure alert\\
+\bottomrule
+\end{longtable}
+
+\subsection{Message Serialization}
+\begin{lstlisting}[language={}]
+Producer: value-serializer = JsonSerializer
+Consumer: value-deserializer = JsonDeserializer
+          spring.json.value.default.type = java.util.HashMap
+
+Producer POJO (e.g., TransactionInitiatedEvent) -> JSON string -> Kafka
+Kafka -> JSON string -> Map<String, Object> (consumer)
+Keys match POJO field names:
+  transactionId, senderAccountNumber, receiverAccountNumber,
+  amount, description
+
+\subsection{Kafka Message Key Usage}
+\begin{lstlisting}[language={}]
+kafkaTemplate.send(topic, savedTransaction.getId(), event);
+                              ^^^^^^^^^^^^^^^^^^^^^^^^
+                              Kafka message KEY
+Purpose:
+  1. Partition routing - same key -> same partition
+  2. Ordering guarantee for same transaction
+  3. Key is NOT in payload (payload = value only)
+
+%========================================================================
+\section{Redis Interactions}
+%========================================================================
+
+\subsection{Transaction Service --- OTP Storage}
+\begin{lstlisting}[language={}]
+Key:    "verification:otp<transactionId>"
+Value:  "<6-digit OTP>"
+TTL:    5 minutes
+
+Operations:
+  SET:    redisTemplate.opsForValue().set(key, otp, 5, MINUTES)
+  GET:    redisTemplate.opsForValue().get(key)    // null if expired
+  DELETE: redisTemplate.delete(key)               // after verification
+
+\subsection{Fraud Detection Service --- Three Patterns}
+
+\subsubsection{Pattern 1: Velocity Check}
+\begin{lstlisting}[language={}]
+Key:    "fraud:velocity<accountNumber>"
+Value:  transaction count (integer)
+
+INCR key                     // atomic increment
+if count == 1: EXPIRE 60s    // reset window after 60 sec
+if count > maxTransactionsPerMinute (5): FRAUD
+
+\subsubsection{Pattern 2: Amount Check (3x average)}
+\begin{lstlisting}[language={}]
+Key:    "fraud:avg_amount<accountNumber>"
+Value:  running average amount
+
+if avgKey null: SET to current amount, return NOT suspicious
+else:
+  threshold = avg * 3.0
+  if amount > threshold: FRAUD
+  newAvg = (avg + amount) / 2   // update running average
+
+\subsubsection{Pattern 3: Balance Check (90\%)}
+\begin{lstlisting}[language={}]
+No Redis - uses account balance fetched via Feign:
+  maxAllowed = balance * 0.90
+  if amount > maxAllowed: FRAUD
+%========================================================================
+\section{Payment Flow (Razorpay)}
+%========================================================================
+
+\subsection{POST /api/v1/payments/create-order}
+\begin{lstlisting}[language={}]
+Request:
+{
+  "accountNumber": "378669440034",
+  "amount": 5000,
+  "description": "Add money"
+}
+
+Flow:
+1. Gateway -> PaymentController
+2. Create RazorpayClient(keyId, keySecret)
+3. amount converted to paise (5000 * 100 = 500000)
+4. razorpay.orders.create(...)  -> external API (sync)
+5. Save Payment (status=CREATED) to MySQL
+6. Return {paymentId, razorpayOrderId, amount, currency, keyId}
+
+\subsection{POST /api/v1/payments/webhook (Razorpay callback)}
+\begin{lstlisting}[language={}]
+Webhook event "payment.captured":
+1. Find payment by razorpayOrderId
+2. Set status = COMPLETED, save to MySQL
+3. creditBalance(accountNumber, amount) -- SYNC Feign to Account Svc
+4. kafka.send("payment.completed") -> Notification Svc sends alert
+
+Webhook event "payment.failed":
+1. Find payment by razorpayOrderId
+2. Set status = FAILED, save to MySQL
+3. kafka.send("payment.failed") -> Notification Svc sends alert
+
+\section{Notification Service (Port 8085)}
+
+\subsection{Consumed Topics}
+\begin{longtable}{p{4.5cm} p{10.5cm}}
+\toprule
+\textbf{Topic} & \textbf{Alert Sent}\\
+\midrule
+\endhead
+transaction.completed & DEBIT ALERT (sender) + CREDIT ALERT (receiver)\\
+fraud.detected & ``ACCOUNT BLOCKED'' alert\\
+transaction.otp.generated & OTP with reason, valid 5 min\\
+transaction.refunded & ``REFUND PROCESSED'' alert\\
+payment.completed & ``PAYMENT SUCCESSFUL'' with Razorpay ID\\
+payment.failed & ``PAYMENT FAILED'' alert\\
+\bottomrule
+\end{longtable}
+
+\subsection{How Alerts Are Sent}
+Currently logs to console (simulated). In production this would be SMS (Twilio), Email (SendGrid), or Push (FCM).
+
+%========================================================================
+\section{Error Handling}
+%========================================================================
+
+\subsection{GlobalExceptionHandler (account-service)}
+\begin{lstlisting}[language={}]
+RuntimeException message contains:
+  "already exists"  -> 400 Bad Request (duplicate email)
+  "not found"       -> 404 Not Found (account not found)
+  otherwise         -> 500 Internal Server Error
+
+Example response:
+{
+  "message": "Account already exists for email: mohit@test.com",
+  "error": "Bad Request",
+  "status": 400,
+  "timestamp": "2026-08-15T20:29:49.225078"
+}
+
+\subsection{Kafka Consumer Error Handling}
+\begin{lstlisting}[language={}]
+All consumers wrap logic in try-catch:
+  catch(Exception e) {
+      log.error("Error ...: {}", e.getMessage());
+  }
+Note: Messages are consumed (not retried) even on error.
+%========================================================================
+\section{Database Schema}
+%========================================================================
+
+\subsection{accounts (account\_db)}
+\begin{lstlisting}[language={}]
+id                    VARCHAR(36)  PK  (UUID)
+account_number        VARCHAR(12)  UNIQUE
+account_holder_name   VARCHAR(255)
+email                 VARCHAR(255) UNIQUE
+phone                 VARCHAR(255)
+account_type          VARCHAR(20)  (SAVINGS/CURRENT/FIXED_DEPOSIT)
+status                VARCHAR(20)  (ACTIVE/BLOCKED/CLOSED)
+balance               DECIMAL(15,2)
+daily_transaction_limit DECIMAL(15,2)
+created_at            DATETIME     (auto)
+updated_at            DATETIME     (auto)
+
+\subsection{transactions (transaction\_db)}
+\begin{lstlisting}[language={}]
+id                    VARCHAR(36)  PK
+sender_account_number VARCHAR(12)
+receiver_account_number VARCHAR(12)
+amount                DECIMAL(15,2)
+type                  VARCHAR(20)  (TRANSFER/DEPOSIT/WITHDRAWAL/PAYMENT)
+status                VARCHAR(20)  (PENDING/PROCESSING/PENDING_VERIFICATION/
+                                    COMPLETED/FAILED/FLAGGED)
+description           VARCHAR(255)
+reference_number      VARCHAR(36)
+failure_reason        VARCHAR(500)
+created_at            DATETIME
+completed_at          DATETIME
+
+\subsection{payments (payment\_db)}
+\begin{lstlisting}[language={}]
+id                    VARCHAR(36)  PK
+razorpay_order_id     VARCHAR(100)
+razorpay_payment_id   VARCHAR(100)
+account_number        VARCHAR(12)
+amount                DECIMAL(15,2)
+currency              VARCHAR(10)
+status                VARCHAR(20)  (CREATED/COMPLETED/FAILED)
+description           VARCHAR(255)
+failure_reason        VARCHAR(500)
+created_at            DATETIME
+
+%========================================================================
+\section{Configuration Details}
+%========================================================================
+
+\subsection{Ports}
+\begin{lstlisting}[language={}]
+Service                Port
+------                 ----
+API Gateway            8080
+Account Service        8081
+Transaction Service    8082
+Payment Service        8083
+Fraud Detection        8084
+Notification Service   8085
+Frontend (Vite)        3000
+MySQL                  3306
+Redis                  6379
+Kafka                  9092 (external) / 29092 (internal)
+
+\subsection{Kafka Config (all services)}
+\begin{lstlisting}[language={}]
+bootstrap-servers: localhost:29092
+consumer:
+  group-id: <service>-group     # e.g., account-service-group
+  auto-offset-reset: earliest
+  key-deserializer: StringDeserializer
+  value-deserializer: JsonDeserializer
+  spring.json.value.default.type: java.util.HashMap
+producer:
+  key-serializer: StringSerializer
+  value-serializer: JsonSerializer
+
+\subsection{Fraud Detection Rules}
+\begin{lstlisting}[language={}]
+fraud:
+  max-transactions-per-minute: 5
+  suspicious-amount-multiplier: 3.0
+  max-balance-percentage: 0.90
+%========================================================================
+\section{Transaction Status State Machine}
+%========================================================================
+
+\begin{lstlisting}[language={}]
+              +--------------+
+              |    PENDING   |
+              +--------------+
+                    |
+                    | transfer() initiated
+                    v
+              +--------------+
+              |  PROCESSING  |<---------------+
+              +--------------+                 |
+              |           |                    |
+       clean  |           | suspicious         | OTP wrong/expired
+              v           v                    |
+   +----------------+  +--------------------+  |
+   |   COMPLETED    |  | PENDING_VERIFICATION| |
+   +----------------+  +--------------------+  |
+                          |                    |
+                     correct OTP               |
+                          v                    |
+   \subsection{Transaction State Machine}|   
+   The transaction lifecycle follows a structured state progression:
+   
+   **PENDING** $
+ightarrow$ **PROCESSING** $
+ightarrow$ { COMPLETED, FLAGGED, FAILED }:
+   
+   - **PENDING**: Transfer initiated; transaction record created with
+     INITIAL status; Razorpay deposit pending.
+   
+   - **PROCESSING**: Fraud velocity check runs; OTP verification begins.
+   
+   - **COMPLETED**: All checks passed; money credited to receiver;
+     Kafka ``transaction.completed'' published; AccountService credits
+     receiver's balance; transaction marked COMPLETED.
+   
+   - **FLAGGED**: Fraud detected (velocity > limit) OR OTP failed;
+     sender's money refunded synchronously (SAGA compensation); account
+     blocked; transaction marked FLAGGED with failure reason.
+   
+   - **FAILED**: Unexpected exception during processing; sender's money
+     refunded automatically (SAGA compensation); transaction marked
+     FLAGGED with failure reason.
+   
+   State transitions: PENDING $
+ightarrow$ PROCESSING $
+ightarrow$ {COMPLETED,
+   |   FLAGGED, FAILED}. Order of checks matters: velocity INCR happens first,
+   |   then OTP verification.
+   +--------------+
+
+%========================================================================
+\section{How to Run}
+%========================================================================
+
+\subsection{Start Infrastructure}
+\begin{lstlisting}[language={}]
+cd /Users/mohitreddy/Documents/DigitalBankingSystem
+docker-compose up -d
+
+\subsection{Start Backend Services (Java 21 required)}
+\begin{lstlisting}[language={}]
+export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
+
+# Terminal per service
+cd account-service          && mvn spring-boot:run
+cd transaction-service      && mvn spring-boot:run
+cd fraud-detection-service  && mvn spring-boot:run
+cd notification-service     && mvn spring-boot:run
+cd payment-service          && mvn spring-boot:run
+cd api-gateway              && mvn spring-boot:run
+
+\subsection{Start Frontend}
+\begin{lstlisting}[language={}]
+cd frontend && npm install && npm run dev
+# http://localhost:3000
+
+\subsection{Stop Everything}
+\begin{lstlisting}[language={}]
+lsof -ti:3000 | xargs kill -9
+pkill -f 'mvn spring-boot:run'
+pkill -f 'java.*banking'
+docker-compose down
+
+\subsection{Useful Commands}
+\begin{lstlisting}[language={}]
+# View accounts
+docker exec mysql mysql -uroot -proot -e \
+  'SELECT account_number, account_holder_name, email, balance, status FROM account_db.accounts;'
+
+# View transactions
+docker exec mysql mysql -uroot -proot -e 'SELECT * FROM transaction_db.transactions;'
+
+# Redis keys
+docker exec -it redis redis-cli keys '*'
+
+# Kafka topics
+docker exec -it kafka kafka-topics --bootstrap-server localhost:9092 --list
+
+%========================================================================
+\section{Key Design Decisions}
+%========================================================================
+
+\begin{enumerate}
+  \item \textbf{Refund is synchronous (Feign)} --- Must confirm money returned before marking FLAGGED. Async would risk ``refunded'' status without actual refund.
+  \item \textbf{Credit receiver is asynchronous (Kafka)} --- Transaction already marked COMPLETED; receiver gets money in background.
+  \item \textbf{Block account is asynchronous (Kafka)} --- Fire-and-forget; no one waits.
+  \item \textbf{OTP in Redis with 5-min TTL} --- Auto-expiry, no cleanup needed.
+  \item \textbf{Velocity counter in Redis with 60s TTL} --- Atomic INCR, thread-safe, auto-reset.
+  \item \textbf{Kafka key = transaction ID} --- Ensures ordering for same transaction.
+  \item \textbf{Kafka 7.6 KRaft mode} --- No Zookeeper dependency.
+  \item \textbf{Feign clients for sync calls} --- Deduct, credit, refund, get balance.
+  \item \textbf{GlobalExceptionHandler} --- Converts RuntimeExceptions to proper HTTP codes (400/404/500).
+  \item \textbf{GlobalExceptionHandler handles ``not found''} --- returns 404 instead of 500.
+\end{enumerate}
+
+\end{document}
+  11    : send debit/credit alerts   Async       Notification Svc
