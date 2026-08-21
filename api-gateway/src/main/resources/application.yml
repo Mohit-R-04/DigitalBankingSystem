@@ -45,11 +45,11 @@ spring:
                 redis-rate-limiter.replenishRate: 10
                 redis-rate-limiter.burstCapacity: 20
 
-        # Payment Service Routes
-        - id: payment-service
+        # Interbank Service Routes
+        - id: interbank-service
           uri: http://localhost:8083
           predicates:
-            - Path=/api/v1/payments/**
+            - Path=/api/v1/interbank/**
           filters:
             - name: RequestRateLimiter
               args:

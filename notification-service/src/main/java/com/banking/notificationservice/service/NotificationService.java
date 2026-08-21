@@ -20,6 +20,12 @@ public class NotificationService {
     public void consumeTransactionCompleted(
             @Payload Map<String, Object> payload) {
         try {
+            // External transfers are covered by the outbound.transfer.sent
+            // alert from the Interbank Service - skip the internal alerts.
+            if (payload.get("rail") != null) {
+                return;
+            }
+
             String senderAccount = (String) payload
                     .get("senderAccountNumber");
             String receiverAccount = (String) payload
@@ -36,6 +42,32 @@ public class NotificationService {
 
         } catch (Exception e) {
             log.error("Error sending transaction notification: {}",
+                    e.getMessage());
+        }
+    }
+
+    /**
+     * Outbound transfer sent to another bank via UPI / IMPS / NEFT.
+     */
+    @KafkaListener(topics = "outbound.transfer.sent")
+    public void consumeOutboundTransferSent(
+            @Payload Map<String, Object> payload) {
+        try {
+            String senderAccount = (String) payload.get("senderAccountNumber");
+            String amount = payload.get("amount").toString();
+            String rail = String.valueOf(payload.get("rail"));
+            String utr = String.valueOf(payload.get("utr"));
+            String beneficiaryBank = String.valueOf(payload.get("beneficiaryBank"));
+
+            sendAlert(senderAccount, "OUTBOUND TRANSFER",
+                    String.format(
+                            "₹%s sent to %s via %s. UTR: %s",
+                            amount,
+                            "null".equals(beneficiaryBank) ? "beneficiary bank" : beneficiaryBank,
+                            rail, utr));
+
+        } catch (Exception e) {
+            log.error("Error sending outbound transfer notification: {}",
                     e.getMessage());
         }
     }
@@ -113,45 +145,48 @@ public class NotificationService {
     }
 
     /**
-     * Payment completed via Razorpay.
+     * Inbound credit received from another bank via UPI / IMPS / NEFT.
      */
-    @KafkaListener(topics = "payment.completed")
-    public void consumePaymentCompleted(
+    @KafkaListener(topics = "inbound.credit.received")
+    public void consumeInboundCreditReceived(
             @Payload Map<String, Object> payload) {
         try {
             String accountNumber = (String) payload.get("accountNumber");
             String amount = payload.get("amount").toString();
+            String rail = String.valueOf(payload.get("rail"));
+            String utr = String.valueOf(payload.get("utr"));
 
-            sendAlert(accountNumber, "PAYMENT SUCCESSFUL",
+            sendAlert(accountNumber, "INBOUND CREDIT",
                     String.format(
-                            "Payment of ₹%s completed. " +
-                                    "Razorpay ID: %s",
-                            amount, payload.get("razorpayPaymentId")));
+                            "₹%s credited to account %s via %s. " +
+                                    "UTR: %s",
+                            amount, accountNumber, rail, utr));
 
         } catch (Exception e) {
-            log.error("Error sending payment notification: {}",
+            log.error("Error sending inbound credit notification: {}",
                     e.getMessage());
         }
     }
 
     /**
-     * Payment failed via Razorpay.
+     * Inbound credit could not be posted.
      */
-    @KafkaListener(topics = "payment.failed")
-    public void consumePaymentFailed(
+    @KafkaListener(topics = "inbound.credit.failed")
+    public void consumeInboundCreditFailed(
             @Payload Map<String, Object> payload) {
         try {
             String accountNumber = (String) payload.get("accountNumber");
             String amount = payload.get("amount").toString();
+            String reason = String.valueOf(payload.get("reason"));
 
-            sendAlert(accountNumber, "❌ PAYMENT FAILED",
+            sendAlert(accountNumber, "INBOUND CREDIT FAILED",
                     String.format(
-                            "Your payment of ₹%s could not be processed. " +
-                                    "Please try again or contact support.",
-                            amount));
+                            "A credit of ₹%s to account %s could not be posted. " +
+                                    "Reason: %s",
+                            amount, accountNumber, reason));
 
         } catch (Exception e) {
-            log.error("Error sending payment failure notification: {}",
+            log.error("Error sending inbound credit failure notification: {}",
                     e.getMessage());
         }
     }

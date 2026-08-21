@@ -46,6 +46,10 @@ account:
   service:
     url: http://localhost:8081
 
+interbank:
+  service:
+    url: http://localhost:8083
+
 management:
   endpoints:
     web:

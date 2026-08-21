@@ -16,14 +16,19 @@ export const creditBalance = (accountNumber, amount) =>
   api.put(`/accounts/${accountNumber}/credit?amount=${amount}`);
 
 // Transaction Service
-export const transferMoney = (data) => api.post('/transactions/transfer', data);
+export const transferMoney = (data) =>
+  api.post('/transactions/transfer', data, {
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+  });
 export const getTransaction = (transactionId) => api.get(`/transactions/${transactionId}`);
 export const getTransactionHistory = (accountNumber) =>
   api.get(`/transactions/account/${accountNumber}`);
 export const verifyOTP = (transactionId, otp) =>
   api.post(`/transactions/${transactionId}/verify?otp=${otp}`);
 
-// Payment Service
-export const createPaymentOrder = (data) => api.post('/payments/create-order', data);
+// Interbank Service (inbound credit rail simulation)
+export const submitInboundCredit = (data) => api.post('/interbank/inbound-credit', data);
+export const getInboundCredits = (accountNumber) =>
+  api.get(`/interbank/credits/${accountNumber}`);
 
 export default api;

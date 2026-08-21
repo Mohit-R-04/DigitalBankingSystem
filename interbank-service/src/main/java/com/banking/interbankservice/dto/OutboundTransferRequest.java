@@ -1,4 +1,4 @@
-package com.banking.transactionservice.dto;
+package com.banking.interbankservice.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -12,24 +12,23 @@ import java.math.BigDecimal;
 @Data
 @AllArgsConstructor
 @NoArgsConstructor
-public class TransferRequest {
+public class OutboundTransferRequest {
 
     @NotBlank(message = "Sender account number is required")
     private String senderAccountNumber;
 
-    @NotBlank(message = "Receiver account number is required")
-    private String receiverAccountNumber;
+    @NotBlank(message = "Beneficiary account number is required")
+    private String beneficiaryAccountNumber;
+
+    private String beneficiaryBank;
+    private String beneficiaryIfsc;
 
     @NotNull(message = "Amount is required")
     @Positive(message = "Amount must be positive")
     private BigDecimal amount;
 
-    private String description;
-
-    // External transfer fields (to another bank). When rail is present the
-    // transfer is routed through the interbank service instead of an
-    // internal account credit.
-    private String beneficiaryBank;
-    private String beneficiaryIfsc;
+    @NotBlank(message = "Rail is required (UPI, IMPS or NEFT)")
     private String rail;
+
+    private String description;
 }

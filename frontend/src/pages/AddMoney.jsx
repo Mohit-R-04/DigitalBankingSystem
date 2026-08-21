@@ -40,7 +40,7 @@ export default function AddMoney() {
           <Wallet className="h-7 w-7 sm:h-8 sm:w-8 text-indigo-600" />
           <h2 className="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">Add Money</h2>
         </div>
-        <p className="text-gray-500 dark:text-gray-400 dark:text-gray-500 text-xs sm:text-sm mb-6">Simulate a deposit to any account. In a real system, this would go through Razorpay.</p>
+        <p className="text-gray-500 dark:text-gray-400 dark:text-gray-500 text-xs sm:text-sm mb-6">Simulate a deposit to any account.</p>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 dark:text-gray-600 mb-1">Account Number</label>

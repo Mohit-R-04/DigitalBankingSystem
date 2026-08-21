@@ -1,53 +1,57 @@
-package com.banking.transactionservice.model;
+package com.banking.interbankservice.model;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "transactions")
+@Table(name = "outbound_transfers")
 @Data
 @AllArgsConstructor
 @NoArgsConstructor
-public class Transaction {
+public class OutboundTransfer {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
     private String id;
 
+    @Column(nullable = false, unique = true)
+    private String utr;
+
     @Column(nullable = false)
     private String senderAccountNumber;
 
     @Column(nullable = false)
-    private String receiverAccountNumber;
+    private String beneficiaryAccountNumber;
+
+    private String beneficiaryBank;
+    private String beneficiaryIfsc;
 
     @Column(nullable = false, precision = 15, scale = 2)
     private BigDecimal amount;
 
-    @Enumerated(EnumType.STRING)
     @Column(nullable = false)
-    private TransactionType type;
+    private String currency;
 
-    @Enumerated(EnumType.STRING)
     @Column(nullable = false)
-    private TransactionStatus status;
-
-    private String description;
-    private String failureReason;
-    private String referenceNumber;
-
-    // External transfer fields - null for internal transfers
-    private String beneficiaryBank;
-    private String beneficiaryIfsc;
     private String rail;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private OutboundTransferStatus status;
+
+    private String failureReason;
+    private String description;
 
     @CreationTimestamp
     private LocalDateTime createdAt;
 
-    private LocalDateTime completedAt;
+    @UpdateTimestamp
+    private LocalDateTime updatedAt;
 }

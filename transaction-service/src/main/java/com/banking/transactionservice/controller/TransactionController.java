@@ -23,9 +23,11 @@ public class TransactionController {
     // Transfer money between accounts
     @PostMapping("/transfer")
     public ResponseEntity<TransactionResponse> transfer(
-            @Valid @RequestBody TransferRequest request) {
+            @Valid @RequestBody TransferRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false)
+            String idempotencyKey) {
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(transactionService.transfer(request));
+                .body(transactionService.transfer(request, idempotencyKey));
     }
 
     // Get transaction by ID

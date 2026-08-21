@@ -23,7 +23,7 @@ public class TransactionEventConsumer {
 
     private final TransactionRepository transactionRepository;
     private final TransactionService transactionService;
-    
+
     private static final long OTP_EXPIRY_MINUTES = 5;
 
     private final KafkaTemplate<String, Object> kafkaTemplate;
@@ -95,6 +95,39 @@ public class TransactionEventConsumer {
         }
         catch(Exception e){
             log.error("Error processing fraud check result: {}", e.getMessage());
+        }
+    }
+
+    @KafkaListener(topics = "transaction.credited")
+    public void consumeCreditSuccess(
+            @Payload Map<String, Object> payload){
+
+        try{
+
+            String transactionId =  (String) payload.get("transactionId");
+            log.info("Receiver credit acknowledged - completing transaction: {}",
+                    transactionId);
+            transactionService.markCompleted(transactionId);
+        }
+        catch(Exception e){
+            log.error("Error completing credited transaction: {}", e.getMessage());
+        }
+    }
+
+    @KafkaListener(topics = "transaction.credit.failed")
+    public void consumeCreditFailure(
+            @Payload Map<String, Object> payload){
+
+        try{
+
+            String transactionId =  (String) payload.get("transactionId");
+            String reason =  (String) payload.get("reason");
+            log.warn("Receiver credit failed - compensating transaction: {} reason: {}",
+                    transactionId, reason);
+            transactionService.handleCreditFailure(transactionId, reason);
+        }
+        catch(Exception e){
+            log.error("Error handling credit failure: {}", e.getMessage());
         }
     }
 

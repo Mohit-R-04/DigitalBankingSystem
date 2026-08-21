@@ -9,12 +9,14 @@ import com.banking.accountservice.repository.AccountRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.security.SecureRandom;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
 
@@ -24,7 +26,11 @@ import java.util.Random;
 public class AccountService {
 
     private final AccountRepository accountRepository;
+    private final KafkaTemplate<String, Object> kafkaTemplate;
     private static SecureRandom secureRandom = new SecureRandom();
+
+    private static final String TRANSACTION_CREDITED_TOPIC = "transaction.credited";
+    private static final String TRANSACTION_CREDIT_FAILED_TOPIC = "transaction.credit.failed";
 
 
     @Transactional
@@ -107,17 +113,35 @@ public class AccountService {
     }
 
 
-    @KafkaListener(topics = "transaction.completed")
-    public void consumeTransactionCompleted(
+    @KafkaListener(topics = "transaction.credit.requested")
+    public void consumeCreditRequested(
             @Payload Map<String, Object> payload) {
+        String transactionId = (String) payload.get("transactionId");
         try {
             String receiverAccount = (String) payload.get("receiverAccountNumber");
             BigDecimal amount = new BigDecimal(payload.get("amount").toString());
 
-            log.info("Crediting account: {} amount: {}", receiverAccount, amount);
+            log.info("Crediting account: {} amount: {} for transaction: {}",
+                    receiverAccount, amount, transactionId);
             creditBalance(receiverAccount, amount);
+
+            // Acknowledge credit success - Transaction Service marks COMPLETED only on this
+            Map<String, Object> event = new HashMap<>();
+            event.put("transactionId", transactionId);
+            event.put("receiverAccountNumber", receiverAccount);
+            event.put("amount", amount);
+            kafkaTemplate.send(TRANSACTION_CREDITED_TOPIC, transactionId, event);
+            log.info("Receiver credited - transaction.credited published: {}",
+                    transactionId);
         } catch (Exception e) {
-            log.error("Error crediting account: {}", e.getMessage());
+            log.error("Receiver credit failed for transaction: {} - {}",
+                    transactionId, e.getMessage());
+
+            // Notify Transaction Service so it compensates (refund sender, mark FLAGGED)
+            Map<String, Object> event = new HashMap<>();
+            event.put("transactionId", transactionId);
+            event.put("reason", e.getMessage());
+            kafkaTemplate.send(TRANSACTION_CREDIT_FAILED_TOPIC, transactionId, event);
         }
     }
 

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1240" viewBox="0 0 1800 1240" role="img" aria-labelledby="title desc">
   <title id="title">Digital Banking System Architecture</title>
-  <desc id="desc">Layered architecture showing the React frontend, API Gateway, Transaction, Account and Payment services, owned MySQL schemas, Kafka event bus, Fraud Detection and Notification workers, Redis responsibilities and Razorpay.</desc>
+  <desc id="desc">Layered architecture showing the React frontend, API Gateway, Transaction, Account and Interbank services, owned MySQL schemas, Kafka event bus, Fraud Detection and Notification workers, Redis responsibilities and the inbound credit rail simulation (UPI | IMPS | NEFT).</desc>
   <defs>
     <linearGradient id="page" x1="0" y1="0" x2="1" y2="1">
       <stop stop-color="#f8fafc"/>
@@ -46,7 +46,7 @@
   <rect x="710" y="168" width="440" height="112" class="node" fill="#e0e7ff" stroke="#4f46e5"/>
   <text x="930" y="203" text-anchor="middle" class="name">Spring Cloud API Gateway :8080</text>
   <text x="930" y="230" text-anchor="middle" class="meta">Path routing | CORS | Redis RequestRateLimiter</text>
-  <text x="930" y="255" text-anchor="middle" class="tiny">IP key | accounts 10/20 | transactions 10/20 | payments 5/10</text>
+  <text x="930" y="255" text-anchor="middle" class="tiny">IP key | accounts 10/20 | transactions 10/20 | interbank 5/10</text>
   <path d="M515 224H710" class="http"/>
   <text x="612" y="209" text-anchor="middle" class="label">REST / JSON</text>
 
@@ -63,14 +63,14 @@
   <rect x="705" y="405" width="390" height="138" class="node" fill="#dcfce7" stroke="#16a34a"/>
   <text x="900" y="442" text-anchor="middle" class="name">Account Service :8081</text>
   <text x="900" y="470" text-anchor="middle" class="meta">Accounts | balance | debit/credit | account status</text>
-  <text x="900" y="496" text-anchor="middle" class="tiny">Consumes transaction.completed and fraud.detected</text>
+  <text x="900" y="496" text-anchor="middle" class="tiny">Consumes transaction.credit.requested and fraud.detected</text>
   <text x="900" y="519" text-anchor="middle" class="tiny">Only service that persists account balance changes</text>
 
   <rect x="1310" y="405" width="390" height="138" class="node" fill="#fee2e2" stroke="#dc2626"/>
-  <text x="1505" y="442" text-anchor="middle" class="name">Payment Service :8083</text>
-  <text x="1505" y="470" text-anchor="middle" class="meta">Razorpay order creation | webhook processing</text>
-  <text x="1505" y="496" text-anchor="middle" class="tiny">Feign credit to Account Service on captured payment</text>
-  <text x="1505" y="519" text-anchor="middle" class="tiny">Produces payment.completed and payment.failed</text>
+  <text x="1505" y="442" text-anchor="middle" class="name">Interbank Service :8083</text>
+  <text x="1505" y="470" text-anchor="middle" class="meta">Inbound credit rail (UPI | IMPS | NEFT)</text>
+  <text x="1505" y="496" text-anchor="middle" class="tiny">Feign credit to Account Service on inbound credit</text>
+  <text x="1505" y="519" text-anchor="middle" class="tiny">Produces inbound.credit.received and inbound.credit.failed</text>
 
   <!-- Gateway routes: separate vertical branches -->
   <path d="M880 280V342H295V405" class="http"/>
@@ -78,18 +78,18 @@
   <path d="M930 280V405" class="http"/>
   <text x="945" y="365" class="label">/accounts/**</text>
   <path d="M980 280V342H1505V405" class="http"/>
-  <text x="1265" y="337" class="label">/api/v1/payments/**</text>
+  <text x="1265" y="337" class="label">/api/v1/interbank/**</text>
 
   <!-- Feign calls, non-overlapping horizontal -->
   <path d="M490 455H705" class="http"/>
   <text x="598" y="438" text-anchor="middle" class="label">Feign: deduct / refund</text>
   <path d="M1310 500H1095" class="http"/>
-  <text x="1202" y="525" text-anchor="middle" class="label">Feign: credit captured payment</text>
+  <text x="1202" y="525" text-anchor="middle" class="label">Feign: credit inbound amount</text>
 
-  <!-- Razorpay -->
+  <!-- Other banks (external) -->
   <rect x="1475" y="565" width="225" height="80" class="node" fill="#fce7f3" stroke="#db2777"/>
-  <text x="1588" y="597" text-anchor="middle" class="name">Razorpay</text>
-  <text x="1588" y="622" text-anchor="middle" class="meta">Orders API + webhook</text>
+  <text x="1588" y="597" text-anchor="middle" class="name">Other banks</text>
+  <text x="1588" y="622" text-anchor="middle" class="meta">UPI | IMPS | NEFT rails</text>
   <path d="M1505 543V565" class="http"/>
 
   <!-- Owned databases -->
@@ -111,7 +111,7 @@
     <ellipse cx="175" cy="13" rx="175" ry="13" class="dbTop"/>
     <rect x="0" y="13" width="350" height="57" class="dbBody"/>
     <ellipse cx="175" cy="70" rx="175" ry="13" class="dbBody"/>
-    <text x="175" y="43" text-anchor="middle" class="dbName">payment_db.payments</text>
+    <text x="175" y="43" text-anchor="middle" class="dbName">interbank_db.inbound_credits</text>
     <text x="175" y="64" text-anchor="middle" class="dbMeta">MySQL 8 | service-owned schema</text>
   </g>
   <path d="M295 543V570" class="store"/>
@@ -123,12 +123,12 @@
   <text x="70" y="740" class="laneTitle">ASYNCHRONOUS EVENT BACKBONE</text>
   <rect x="160" y="770" width="1480" height="72" rx="20" fill="url(#kafka)" stroke="#7c3aed" stroke-width="2.2" filter="url(#shadow)"/>
   <text x="900" y="800" text-anchor="middle" class="name">Apache Kafka :29092 (application) / :9092 (host)</text>
-  <text x="900" y="825" text-anchor="middle" class="meta">transaction.* | fraud.* | verification.required | payment.* | JSON messages | separate consumer groups</text>
+  <text x="900" y="825" text-anchor="middle" class="meta">transaction.* | fraud.* | verification.required | inbound.credit.* | outbound.transfer.sent | JSON messages | separate consumer groups</text>
 
   <!-- Clear event ports around DBs -->
   <path d="M100 500H78V806H160" class="eventBoth"/>
   <path d="M1095 455H1125V735H600V770" class="event"/>
-  <text x="815" y="728" text-anchor="middle" class="tiny">Account consumes completed / fraud detected</text>
+  <text x="815" y="728" text-anchor="middle" class="tiny">Account consumes credit requests / fraud blocks</text>
   <path d="M1700 500H1722V806H1640" class="event"/>
 
   <!-- Workers -->
@@ -146,7 +146,7 @@
 
   <rect x="1245" y="980" width="420" height="120" class="node" fill="#cffafe" stroke="#0891b2"/>
   <text x="1455" y="1017" text-anchor="middle" class="name">Notification Service :8085</text>
-  <text x="1455" y="1045" text-anchor="middle" class="meta">Consumes six Kafka topics</text>
+  <text x="1455" y="1045" text-anchor="middle" class="meta">Consumes seven alert topics</text>
   <text x="1455" y="1070" text-anchor="middle" class="tiny">Current delivery implementation: application logs</text>
 
   <path d="M345 980V842" class="eventBoth"/>

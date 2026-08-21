@@ -22,6 +22,8 @@ public class TransactionResponse {
     private String description;
     private String referenceNumber;
     private String failureReason;
+    private String beneficiaryBank;
+    private String rail;
     private LocalDateTime createdAt;
     private LocalDateTime completedAt;
 }

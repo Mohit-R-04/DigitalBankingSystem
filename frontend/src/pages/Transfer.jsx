@@ -6,18 +6,29 @@ import StatusBadge from '../components/StatusBadge';
 import OTPModal from '../components/OTPModal';
 
 export default function Transfer() {
-  const [form, setForm] = useState({ senderAccountNumber: '', receiverAccountNumber: '', amount: '', description: '' });
+  const [form, setForm] = useState({ senderAccountNumber: '', receiverAccountNumber: '', amount: '', description: '', external: false, rail: 'UPI', beneficiaryBank: '' });
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [otpTxn, setOtpTxn] = useState(null);
 
   const handleChange = (e) => setForm({ ...form, [e.target.name]: e.target.value });
+  const toggleExternal = () => setForm({ ...form, external: !form.external });
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
+    const payload = {
+      senderAccountNumber: form.senderAccountNumber.trim(),
+      receiverAccountNumber: form.receiverAccountNumber.trim(),
+      amount: parseFloat(form.amount),
+      description: form.description,
+    };
+    if (form.external) {
+      payload.rail = form.rail;
+      payload.beneficiaryBank = form.beneficiaryBank.trim();
+    }
     try {
-      const res = await transferMoney({ ...form, amount: parseFloat(form.amount) });
+      const res = await transferMoney(payload);
       setResult(res.data);
       toast.success('Transfer initiated!');
       if (res.data.status === 'PENDING_VERIFICATION') setOtpTxn(res.data.id);
@@ -67,6 +78,30 @@ export default function Transfer() {
                 onChange={handleChange} placeholder="e.g. Rent payment" className="input-field" />
             </div>
           </div>
+
+          <label className="flex items-center space-x-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+            <input type="checkbox" checked={form.external} onChange={toggleExternal} className="h-4 w-4" />
+            <span>Transfer to another bank (NEFT / IMPS / UPI)</span>
+          </label>
+
+          {form.external && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 dark:text-gray-600 mb-1">Beneficiary Bank</label>
+                <input type="text" name="beneficiaryBank" value={form.beneficiaryBank}
+                  onChange={handleChange} placeholder="e.g. HDFC Bank" className="input-field" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 dark:text-gray-600 mb-1">Payment Rail</label>
+                <select name="rail" value={form.rail} onChange={handleChange} className="input-field">
+                  <option value="UPI">UPI (instant)</option>
+                  <option value="IMPS">IMPS (instant)</option>
+                  <option value="NEFT">NEFT (batched)</option>
+                </select>
+              </div>
+            </div>
+          )}
+
           <button type="submit" disabled={loading} className="btn-primary">
             <Send className="h-4 w-4" /><span>{loading ? 'Processing...' : 'Send Money'}</span>
           </button>
@@ -86,6 +121,7 @@ export default function Transfer() {
             <div><span className="text-gray-500 dark:text-gray-400 dark:text-gray-500">To</span><p className="font-mono truncate">{result.receiverAccountNumber}</p></div>
             <div><span className="text-gray-500 dark:text-gray-400 dark:text-gray-500">Amount</span><p className="font-bold text-lg">₹{Number(result.amount).toLocaleString('en-IN')}</p></div>
             <div><span className="text-gray-500 dark:text-gray-400 dark:text-gray-500">Ref</span><p className="font-mono text-xs truncate">{result.referenceNumber}</p></div>
+            {result.rail && <div><span className="text-gray-500 dark:text-gray-400 dark:text-gray-500">Via</span><p className="font-mono text-xs">{result.rail}{result.beneficiaryBank ? ` · ${result.beneficiaryBank}` : ''}</p></div>}
           </div>
           {result.failureReason && <div className="mt-3 bg-red-50 rounded-lg p-3"><p className="text-sm text-red-700">{result.failureReason}</p></div>}
         </div>
