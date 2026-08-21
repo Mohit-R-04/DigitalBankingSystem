@@ -1,135 +1,109 @@
 package com.banking.interbankservice.service;
 
 import com.banking.interbankservice.client.AccountServiceClient;
+import com.banking.interbankservice.client.TransactionServiceClient;
+import com.banking.interbankservice.dto.InboundCreditRecordRequest;
 import com.banking.interbankservice.dto.InboundCreditRequest;
 import com.banking.interbankservice.dto.InboundCreditResponse;
-import com.banking.interbankservice.model.InboundCredit;
 import com.banking.interbankservice.model.InboundCreditStatus;
-import com.banking.interbankservice.model.Rail;
-import com.banking.interbankservice.repository.InboundCreditRepository;
 import com.banking.interbankservice.util.UtrGenerator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class InboundCreditService {
 
-    private final InboundCreditRepository inboundCreditRepository;
-    private final AccountServiceClient accountServiceClient;
-    private final KafkaTemplate<String, Object> kafkaTemplate;
-
     private static final String INBOUND_CREDIT_RECEIVED_TOPIC = "inbound.credit.received";
     private static final String INBOUND_CREDIT_FAILED_TOPIC = "inbound.credit.failed";
+
+    private final AccountServiceClient accountServiceClient;
+    private final TransactionServiceClient transactionServiceClient;
+    private final KafkaTemplate<String, Object> kafkaTemplate;
 
     /**
      * Simulates the interbank switch (NPCI / RBI / SWIFT) delivering an
      * inbound credit message to our bank. The sender's bank has already
-     * debited the sender; we just credit the beneficiary account and keep
-     * the UTR for reconciliation.
+     * debited the sender; we credit the beneficiary account and ask
+     * Transaction Service to record the completed credit in the bank's
+     * own transactions ledger. The rail itself keeps no records - it
+     * only mints the UTR.
      */
-    @Transactional
     public InboundCreditResponse receive(InboundCreditRequest request) {
+        String utr = UtrGenerator.generate(request.getRail().name());
         log.info("Inbound credit received - account: {} amount: {} rail: {}",
                 request.getAccountNumber(), request.getAmount(), request.getRail());
 
-        String utr = UtrGenerator.generate(request.getRail().name());
-
-        InboundCredit credit = new InboundCredit();
-        credit.setUtr(utr);
-        credit.setAccountNumber(request.getAccountNumber());
-        credit.setAmount(request.getAmount());
-        credit.setCurrency("INR");
-        credit.setRail(request.getRail());
-        credit.setSenderBank(request.getSenderBank());
-        credit.setSenderName(request.getSenderName());
-        credit.setStatus(InboundCreditStatus.RECEIVED);
-
-        InboundCredit saved = inboundCreditRepository.save(credit);
-
         try {
+            // 1. Credit the beneficiary account (the money arrives)
             accountServiceClient.creditBalance(
-                    request.getAccountNumber(),
-                    request.getAmount());
-            log.info("Account {} credited with {} (UTR: {})",
-                    request.getAccountNumber(), request.getAmount(), utr);
+                    request.getAccountNumber(), request.getAmount());
 
-            saved.setStatus(InboundCreditStatus.COMPLETED);
-            inboundCreditRepository.save(saved);
+            // 2. Record the completed credit in the bank's transactions ledger
+            transactionServiceClient.recordInboundCredit(
+                    new InboundCreditRecordRequest(
+                            request.getAccountNumber(), request.getAmount(),
+                            request.getRail().name(), utr,
+                            request.getSenderBank(), request.getSenderName()));
 
-            publishReceived(saved);
-            return mapToResponse(saved);
+            publishReceived(request, utr);
+            return mapToResponse(utr, request, InboundCreditStatus.COMPLETED, null);
 
         } catch (Exception e) {
             log.error("Inbound credit failed for account: {} - {}",
                     request.getAccountNumber(), e.getMessage());
-
-            saved.setStatus(InboundCreditStatus.FAILED);
-            saved.setFailureReason(e.getMessage());
-            inboundCreditRepository.save(saved);
-
-            publishFailed(saved);
-            return mapToResponse(saved);
+            publishFailed(request, utr, e.getMessage());
+            return mapToResponse(utr, request, InboundCreditStatus.FAILED, e.getMessage());
         }
     }
 
-    public List<InboundCreditResponse> getCredits(String accountNumber) {
-        return inboundCreditRepository
-                .findByAccountNumberOrderByCreatedAtDesc(accountNumber)
-                .stream()
-                .map(this::mapToResponse)
-                .collect(Collectors.toList());
-    }
-
-    private void publishReceived(InboundCredit credit) {
+    private void publishReceived(InboundCreditRequest request, String utr) {
         Map<String, Object> event = new HashMap<>();
-        event.put("creditId", credit.getId());
-        event.put("utr", credit.getUtr());
-        event.put("accountNumber", credit.getAccountNumber());
-        event.put("amount", credit.getAmount());
-        event.put("rail", credit.getRail().name());
-        event.put("senderBank", credit.getSenderBank());
-        event.put("senderName", credit.getSenderName());
+        event.put("utr", utr);
+        event.put("accountNumber", request.getAccountNumber());
+        event.put("amount", request.getAmount());
+        event.put("rail", request.getRail().name());
+        event.put("senderBank", request.getSenderBank());
+        event.put("senderName", request.getSenderName());
 
-        kafkaTemplate.send(INBOUND_CREDIT_RECEIVED_TOPIC, credit.getId(), event);
-        log.info("inbound.credit.received published for credit: {}", credit.getId());
+        kafkaTemplate.send(INBOUND_CREDIT_RECEIVED_TOPIC, utr, event);
+        log.info("inbound.credit.received published - UTR: {}", utr);
     }
 
-    private void publishFailed(InboundCredit credit) {
+    private void publishFailed(InboundCreditRequest request, String utr, String reason) {
         Map<String, Object> event = new HashMap<>();
-        event.put("creditId", credit.getId());
-        event.put("utr", credit.getUtr());
-        event.put("accountNumber", credit.getAccountNumber());
-        event.put("amount", credit.getAmount());
-        event.put("rail", credit.getRail().name());
-        event.put("reason", credit.getFailureReason());
+        event.put("utr", utr);
+        event.put("accountNumber", request.getAccountNumber());
+        event.put("amount", request.getAmount());
+        event.put("rail", request.getRail().name());
+        event.put("reason", reason);
 
-        kafkaTemplate.send(INBOUND_CREDIT_FAILED_TOPIC, credit.getId(), event);
-        log.warn("inbound.credit.failed published for credit: {}", credit.getId());
+        kafkaTemplate.send(INBOUND_CREDIT_FAILED_TOPIC, utr, event);
+        log.warn("inbound.credit.failed published - UTR: {}", utr);
     }
 
-    private InboundCreditResponse mapToResponse(InboundCredit credit) {
+    private InboundCreditResponse mapToResponse(String utr, InboundCreditRequest request,
+                                                InboundCreditStatus status, String failureReason) {
         InboundCreditResponse response = new InboundCreditResponse();
-        response.setCreditId(credit.getId());
-        response.setUtr(credit.getUtr());
-        response.setAccountNumber(credit.getAccountNumber());
-        response.setAmount(credit.getAmount());
-        response.setCurrency(credit.getCurrency());
-        response.setRail(credit.getRail());
-        response.setSenderBank(credit.getSenderBank());
-        response.setSenderName(credit.getSenderName());
-        response.setStatus(credit.getStatus());
-        response.setFailureReason(credit.getFailureReason());
-        response.setCreatedAt(credit.getCreatedAt());
+        response.setCreditId(UUID.randomUUID().toString());
+        response.setUtr(utr);
+        response.setAccountNumber(request.getAccountNumber());
+        response.setAmount(request.getAmount());
+        response.setCurrency("INR");
+        response.setRail(request.getRail());
+        response.setSenderBank(request.getSenderBank());
+        response.setSenderName(request.getSenderName());
+        response.setStatus(status);
+        response.setFailureReason(failureReason);
+        response.setCreatedAt(LocalDateTime.now());
         return response;
     }
 }

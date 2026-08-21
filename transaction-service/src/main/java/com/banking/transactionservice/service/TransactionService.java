@@ -2,6 +2,7 @@ package com.banking.transactionservice.service;
 
 import com.banking.transactionservice.client.AccountServiceClient;
 import com.banking.transactionservice.client.InterbankServiceClient;
+import com.banking.transactionservice.dto.InboundCreditRecordRequest;
 import com.banking.transactionservice.dto.OutboundTransferRequest;
 import com.banking.transactionservice.dto.OutboundTransferResponse;
 import com.banking.transactionservice.dto.TransactionResponse;
@@ -22,12 +23,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Service
 @Slf4j
@@ -80,7 +83,10 @@ public class TransactionService {
         transaction.setSenderAccountNumber(request.getSenderAccountNumber());
         transaction.setReceiverAccountNumber(request.getReceiverAccountNumber());
         transaction.setAmount(request.getAmount());
-        transaction.setType(TransactionType.TRANSFER);
+        // External transfers (rail present) are recorded as PAYMENT
+        transaction.setType(request.getRail() != null && !request.getRail().isBlank()
+                ? TransactionType.PAYMENT
+                : TransactionType.TRANSFER);
         transaction.setStatus(TransactionStatus.PROCESSING);
         transaction.setDescription(request.getDescription());
         transaction.setReferenceNumber(UUID.randomUUID().toString());
@@ -123,11 +129,51 @@ public class TransactionService {
 
     public List<TransactionResponse> getTransactionHistory(String accountNumber) {
 
-        return transactionRepository
-                .findBySenderAccountNumberOrderByCreatedAtDesc(accountNumber)
-                .stream()
+        // Return both sides of the account: money sent (sender) and money
+        // received (receiver), merged into one time-ordered statement.
+        List<Transaction> sent = transactionRepository
+                .findBySenderAccountNumberOrderByCreatedAtDesc(accountNumber);
+        List<Transaction> received = transactionRepository
+                .findByReceiverAccountNumberOrderByCreatedAtDesc(accountNumber);
+
+        return Stream.concat(sent.stream(), received.stream())
+                .sorted(Comparator.comparing(
+                        Transaction::getCreatedAt,
+                        Comparator.nullsLast(Comparator.reverseOrder())))
                 .map(this::mapToResponse)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Record an external credit received via a payment rail. The Interbank
+     * Service (simulated switch) has already credited the beneficiary
+     * account; this is the bank's ledger entry for that completed credit -
+     * every credit/debit that completes is recorded in the transactions
+     * table, internal or external.
+     */
+    public TransactionResponse recordInboundCredit(InboundCreditRecordRequest request) {
+        Transaction transaction = new Transaction();
+        transaction.setSenderAccountNumber(
+                request.getSenderName() != null ? request.getSenderName()
+                : request.getSenderBank() != null ? request.getSenderBank()
+                : "EXTERNAL");
+        transaction.setReceiverAccountNumber(request.getAccountNumber());
+        transaction.setAmount(request.getAmount());
+        transaction.setType(TransactionType.PAYMENT);
+        transaction.setStatus(TransactionStatus.COMPLETED);
+        transaction.setReferenceNumber(request.getUtr());
+        transaction.setRail(request.getRail());
+        transaction.setCompletedAt(LocalDateTime.now());
+        transaction.setDescription(request.getDescription() != null
+                ? request.getDescription()
+                : "External credit via " + request.getRail()
+                + (request.getSenderBank() != null
+                        ? " from " + request.getSenderBank() : ""));
+
+        Transaction saved = transactionRepository.save(transaction);
+        log.info("External credit recorded in ledger - account: {} amount: {} UTR: {}",
+                request.getAccountNumber(), request.getAmount(), request.getUtr());
+        return mapToResponse(saved);
     }
 
     public TransactionResponse verifyOTP(String transactionID, String otp) {

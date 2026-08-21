@@ -13,8 +13,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.List;
-
 @RestController
 @RequestMapping("/api/v1/interbank")
 @RequiredArgsConstructor
@@ -24,7 +22,9 @@ public class InterbankController {
     private final InboundCreditService inboundCreditService;
     private final OutboundTransferService outboundTransferService;
 
-    // Simulates the interbank switch delivering an inbound credit message
+    // Simulates the interbank switch delivering an inbound credit message.
+    // The account is credited and the completed credit is recorded in the
+    // bank's own transactions ledger; the rail keeps no records.
     @PostMapping("/inbound-credit")
     public ResponseEntity<InboundCreditResponse> receiveInboundCredit(
             @Valid @RequestBody InboundCreditRequest request) {
@@ -34,15 +34,9 @@ public class InterbankController {
                 .body(inboundCreditService.receive(request));
     }
 
-    // Inbound credit history for an account (statement-style)
-    @GetMapping("/credits/{accountNumber}")
-    public ResponseEntity<List<InboundCreditResponse>> getCredits(
-            @PathVariable String accountNumber) {
-        return ResponseEntity.ok(
-                inboundCreditService.getCredits(accountNumber));
-    }
-
-    // Simulates the interbank switch routing an outbound payment to another bank
+    // Simulates the interbank switch routing an outbound payment to another
+    // bank. The bank-side debit and ledger entry are recorded by Transaction
+    // Service; the rail only mints the UTR.
     @PostMapping("/outbound-transfer")
     public ResponseEntity<OutboundTransferResponse> sendOutboundTransfer(
             @Valid @RequestBody OutboundTransferRequest request) {
@@ -50,13 +44,5 @@ public class InterbankController {
                 request.getSenderAccountNumber());
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(outboundTransferService.send(request));
-    }
-
-    // Outbound transfer history for an account
-    @GetMapping("/outbound/{accountNumber}")
-    public ResponseEntity<List<OutboundTransferResponse>> getOutboundTransfers(
-            @PathVariable String accountNumber) {
-        return ResponseEntity.ok(
-                outboundTransferService.getTransfers(accountNumber));
     }
 }

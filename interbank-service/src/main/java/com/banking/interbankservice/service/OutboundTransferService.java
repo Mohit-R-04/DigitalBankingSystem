@@ -2,21 +2,18 @@ package com.banking.interbankservice.service;
 
 import com.banking.interbankservice.dto.OutboundTransferRequest;
 import com.banking.interbankservice.dto.OutboundTransferResponse;
-import com.banking.interbankservice.model.OutboundTransfer;
 import com.banking.interbankservice.model.OutboundTransferStatus;
-import com.banking.interbankservice.repository.OutboundTransferRepository;
 import com.banking.interbankservice.util.UtrGenerator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
@@ -26,91 +23,60 @@ public class OutboundTransferService {
     private static final Set<String> SUPPORTED_RAILS = Set.of("UPI", "IMPS", "NEFT");
     private static final String OUTBOUND_TRANSFER_SENT_TOPIC = "outbound.transfer.sent";
 
-    private final OutboundTransferRepository outboundTransferRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
 
     /**
-     * Simulates the interbank switch (NPCI / RBI) delivering an outbound
+     * Simulates the interbank switch (NPCI / RBI) routing an outbound
      * payment message to the beneficiary's bank. The sender was already
-     * debited by Transaction Service - this is the rail leg only: the
-     * switch routes the message, returns a UTR, and the beneficiary bank
-     * credits its customer.
+     * debited and the bank-side ledger entry recorded by Transaction
+     * Service before this call - this is the rail leg only: mint the UTR,
+     * settle, and notify. The rail keeps no records of its own.
      */
-    @Transactional
     public OutboundTransferResponse send(OutboundTransferRequest request) {
+        String rail = request.getRail().toUpperCase();
         log.info("Outbound transfer received - sender: {} beneficiary: {} amount: {} rail: {}",
                 request.getSenderAccountNumber(),
                 request.getBeneficiaryAccountNumber(),
                 request.getAmount(),
                 request.getRail());
 
-        String rail = request.getRail().toUpperCase();
-
-        OutboundTransfer transfer = new OutboundTransfer();
-        transfer.setSenderAccountNumber(request.getSenderAccountNumber());
-        transfer.setBeneficiaryAccountNumber(request.getBeneficiaryAccountNumber());
-        transfer.setBeneficiaryBank(request.getBeneficiaryBank());
-        transfer.setBeneficiaryIfsc(request.getBeneficiaryIfsc());
-        transfer.setAmount(request.getAmount());
-        transfer.setCurrency("INR");
-        transfer.setRail(rail);
-        transfer.setDescription(request.getDescription());
-
         if (!SUPPORTED_RAILS.contains(rail)) {
-            transfer.setStatus(OutboundTransferStatus.FAILED);
-            transfer.setFailureReason("Unsupported rail: " + request.getRail());
-            OutboundTransfer failed = outboundTransferRepository.save(transfer);
-            return mapToResponse(failed);
+            return mapToResponse(null, request, OutboundTransferStatus.FAILED,
+                    "Unsupported rail: " + request.getRail());
         }
 
-        transfer.setUtr(UtrGenerator.generate(rail));
-        transfer.setStatus(OutboundTransferStatus.RECEIVED);
-        OutboundTransfer saved = outboundTransferRepository.save(transfer);
-
-        // The switch routes the payment and settles it - simulate completion
-        saved.setStatus(OutboundTransferStatus.COMPLETED);
-        outboundTransferRepository.save(saved);
-
-        publishTransferSent(saved);
-        return mapToResponse(saved);
+        String utr = UtrGenerator.generate(rail);
+        publishTransferSent(request, utr);
+        return mapToResponse(utr, request, OutboundTransferStatus.COMPLETED, null);
     }
 
-    public List<OutboundTransferResponse> getTransfers(String accountNumber) {
-        return outboundTransferRepository
-                .findBySenderAccountNumberOrderByCreatedAtDesc(accountNumber)
-                .stream()
-                .map(this::mapToResponse)
-                .collect(Collectors.toList());
-    }
-
-    private void publishTransferSent(OutboundTransfer transfer) {
+    private void publishTransferSent(OutboundTransferRequest request, String utr) {
         Map<String, Object> event = new HashMap<>();
-        event.put("transferId", transfer.getId());
-        event.put("utr", transfer.getUtr());
-        event.put("senderAccountNumber", transfer.getSenderAccountNumber());
-        event.put("beneficiaryAccountNumber", transfer.getBeneficiaryAccountNumber());
-        event.put("beneficiaryBank", transfer.getBeneficiaryBank());
-        event.put("amount", transfer.getAmount());
-        event.put("rail", transfer.getRail());
+        event.put("utr", utr);
+        event.put("senderAccountNumber", request.getSenderAccountNumber());
+        event.put("beneficiaryAccountNumber", request.getBeneficiaryAccountNumber());
+        event.put("beneficiaryBank", request.getBeneficiaryBank());
+        event.put("amount", request.getAmount());
+        event.put("rail", request.getRail().toUpperCase());
 
-        kafkaTemplate.send(OUTBOUND_TRANSFER_SENT_TOPIC,
-                transfer.getId(), event);
-        log.info("outbound.transfer.sent published for transfer: {}", transfer.getId());
+        kafkaTemplate.send(OUTBOUND_TRANSFER_SENT_TOPIC, utr, event);
+        log.info("outbound.transfer.sent published - UTR: {}", utr);
     }
 
-    private OutboundTransferResponse mapToResponse(OutboundTransfer transfer) {
+    private OutboundTransferResponse mapToResponse(String utr, OutboundTransferRequest request,
+                                                   OutboundTransferStatus status, String failureReason) {
         OutboundTransferResponse response = new OutboundTransferResponse();
-        response.setTransferId(transfer.getId());
-        response.setUtr(transfer.getUtr());
-        response.setSenderAccountNumber(transfer.getSenderAccountNumber());
-        response.setBeneficiaryAccountNumber(transfer.getBeneficiaryAccountNumber());
-        response.setBeneficiaryBank(transfer.getBeneficiaryBank());
-        response.setAmount(transfer.getAmount());
-        response.setCurrency(transfer.getCurrency());
-        response.setRail(transfer.getRail());
-        response.setStatus(transfer.getStatus());
-        response.setFailureReason(transfer.getFailureReason());
-        response.setCreatedAt(transfer.getCreatedAt());
+        response.setTransferId(UUID.randomUUID().toString());
+        response.setUtr(utr);
+        response.setSenderAccountNumber(request.getSenderAccountNumber());
+        response.setBeneficiaryAccountNumber(request.getBeneficiaryAccountNumber());
+        response.setBeneficiaryBank(request.getBeneficiaryBank());
+        response.setAmount(request.getAmount());
+        response.setCurrency("INR");
+        response.setRail(request.getRail().toUpperCase());
+        response.setStatus(status);
+        response.setFailureReason(failureReason);
+        response.setCreatedAt(LocalDateTime.now());
         return response;
     }
 }

@@ -28,7 +28,5 @@ export const verifyOTP = (transactionId, otp) =>
 
 // Interbank Service (inbound credit rail simulation)
 export const submitInboundCredit = (data) => api.post('/interbank/inbound-credit', data);
-export const getInboundCredits = (accountNumber) =>
-  api.get(`/interbank/credits/${accountNumber}`);
 
 export default api;

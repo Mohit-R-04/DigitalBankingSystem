@@ -181,7 +181,6 @@ flowchart LR
 
     A --> AD[(MySQL\naccount_db)]
     T --> TD[(MySQL\ntransaction_db)]
-    I --> ID[(MySQL\ninterbank_db)]
 
     T -->|OpenFeign debit/credit/balance| A
     I -->|OpenFeign credit| A
@@ -255,7 +254,7 @@ Arrow labels show the direction of events; the exact topic each service produces
 - Simulates the interbank switch (NPCI / RBI / SWIFT) for both directions of the rail.
 - **Inbound**: receives a credit message from another bank, validates it, posts it to the beneficiary account with a Unique Transaction Reference (UTR).
 - **Outbound**: routes a payment message to the beneficiary's bank and returns a Unique Transaction Reference (UTR) (the sender is debited by Transaction Service first).
-- Stores inbound credit and outbound transfer records for reconciliation.
+- Keeps no records of its own — every completed credit or debit is a ledger entry in the bank's `transactions` table, carrying the UTR as its reference.
 - Publishes inbound credit received/failed and outbound transfer sent events.
 - Relies on real-world payment rails (UPI, IMPS, NEFT, SWIFT) — the systems that actually move money between banks. See section 6 for how they work. A bank does not need a gateway layer: it is itself a participant on those rails.
 
@@ -340,14 +339,14 @@ This is a development simulation endpoint used to seed balances. It is separate 
 Another bank sends money through the rail (UPI / IMPS / NEFT)
     -> POST /api/v1/interbank/inbound-credit  (simulates the switch delivering the credit)
     -> Interbank Service mints a Unique Transaction Reference (UTR) (e.g. NEFT20260821012345)
-    -> Inbound credit stored as RECEIVED
     -> Calls the account credit endpoint -> balance updated
-    -> Credit marked COMPLETED
+    -> Asks Transaction Service to record the completed credit in the bank's
+       transactions ledger (type PAYMENT, UTR as reference number, rail set)
     -> inbound.credit.received published -> Notification logs "₹X credited via NEFT, UTR: ..."
     -> Response returns the Unique Transaction Reference (UTR)
 ```
 
-This is the "receiving" side of external payments — money arriving from another bank. It is **not** the Add Money page: the Interbank Service calls the account credit endpoint directly, and the Add Money page is only a separate simple deposit shortcut for testing.
+This is the "receiving" side of external payments — money arriving from another bank. It is **not** the Add Money page: the Interbank Service calls the account credit endpoint directly, and the Add Money page is only a separate simple deposit shortcut for testing. The rail itself keeps no records — the completed credit is a ledger entry in the bank's `transactions` table, exactly like every other credit or debit.
 
 ### 4. Normal transfer flow
 
@@ -387,6 +386,8 @@ sequenceDiagram
 The transaction is **not** marked `COMPLETED` when the fraud check passes. Transaction Service first publishes `transaction.credit.requested`; Account Service credits the receiver and replies with `transaction.credited`. Only after consuming that acknowledgment does Transaction Service set the status to `COMPLETED` and publish `transaction.completed` for notifications. If the credit fails, Account Service publishes `transaction.credit.failed` instead, and Transaction Service compensates by refunding the sender and marking the transaction `FLAGGED`.
 
 For an **external transfer** (request carries `rail` / `beneficiaryBank`), the credit leg is different: instead of `transaction.credit.requested`, Transaction Service calls the Interbank Service outbound endpoint, which simulates the rail delivering the payment to the beneficiary's bank and returns a Unique Transaction Reference (UTR). The transaction is marked `COMPLETED` with the UTR as its reference. If the rail rejects the payment, the saga compensates by refunding the sender.
+
+**One record — the bank's ledger.** Every credit or debit that completes — internal or external — is recorded in the bank's `transactions` table. For an external transfer, the sender is debited and the ledger entry created by Transaction Service before the rail is called; the Interbank Service (the simulated switch) only mints the **UTR** and returns it, and the bank stores it as the transaction's reference number — exactly how a real bank's posting carries the switch's UTR for reconciliation. The rail keeps no records of its own; conceptually it is the rail, not the bank.
 
 Transfer request:
 
@@ -605,39 +606,11 @@ erDiagram
         string description
         string failureReason
         string referenceNumber
-        datetime createdAt
-        datetime completedAt
-    }
-
-    INBOUND_CREDIT {
-        string id PK
-        string utr UK
-        string accountNumber
-        decimal amount
-        string currency
-        string rail
-        string senderBank
-        string senderName
-        string status
-        string failureReason
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    OUTBOUND_TRANSFER {
-        string id PK
-        string utr UK
-        string senderAccountNumber
-        string beneficiaryAccountNumber
         string beneficiaryBank
         string beneficiaryIfsc
-        decimal amount
-        string currency
         string rail
-        string status
-        string failureReason
         datetime createdAt
-        datetime updatedAt
+        datetime completedAt
     }
 
     IDEMPOTENCY_RECORD {
@@ -651,8 +624,6 @@ erDiagram
 
     ACCOUNT ||..o{ TRANSACTION : senderAccountNumber
     ACCOUNT ||..o{ TRANSACTION : receiverAccountNumber
-    ACCOUNT ||..o{ INBOUND_CREDIT : accountNumber
-    ACCOUNT ||..o{ OUTBOUND_TRANSFER : senderAccountNumber
 ```
 
 Mongo-style relationships are not used here. The application uses MySQL tables and account numbers as business identifiers across service boundaries. There are no database-level foreign keys across services because each service owns its own database.
@@ -703,42 +674,6 @@ Both fields are UUIDs but serve different roles:
 
 There is no derivation between them — `reference_number` is an independent random UUID, not computed from `id`, so a customer cannot derive one from the other.
 
-### `interbank_db.inbound_credits`
-
-| Field | Type | Notes |
-|---|---|---|
-| `id` | String UUID | Primary key generated by JPA. |
-| `utr` | String | Unique Transaction Reference (UTR) minted by the service (e.g. `NEFT20260821012345`). |
-| `account_number` | String | Beneficiary account credited. |
-| `amount` | Decimal(15,2) | Credit amount. |
-| `currency` | String | Current value is `INR`. |
-| `rail` | Enum string | `UPI`, `IMPS`, `NEFT`. |
-| `sender_bank` | String | Optional sender bank name. |
-| `sender_name` | String | Optional sender name. |
-| `status` | Enum string | `RECEIVED`, `COMPLETED`, `FAILED`. |
-| `failure_reason` | String | Reason when the credit could not be posted. |
-| `created_at` | DateTime | Hibernate creation timestamp. |
-| `updated_at` | DateTime | Hibernate update timestamp. |
-
-### `interbank_db.outbound_transfers`
-
-| Field | Type | Notes |
-|---|---|---|
-| `id` | String UUID | Primary key generated by JPA. |
-| `utr` | String | Unique Transaction Reference (UTR) minted by the service (e.g. `NEFT20260821123456`). |
-| `sender_account_number` | String | Sender account that was debited by Transaction Service. |
-| `beneficiary_account_number` | String | Beneficiary account at the other bank. |
-| `beneficiary_bank` | String | Beneficiary bank name. |
-| `beneficiary_ifsc` | String | Beneficiary bank IFSC. |
-| `amount` | Decimal(15,2) | Transfer amount. |
-| `currency` | String | Current value is `INR`. |
-| `rail` | String | `UPI`, `IMPS`, or `NEFT`. |
-| `status` | Enum string | `RECEIVED`, `COMPLETED`, `FAILED`. |
-| `failure_reason` | String | Reason when the rail rejected the payment. |
-| `description` | String | Optional note. |
-| `created_at` | DateTime | Hibernate creation timestamp. |
-| `updated_at` | DateTime | Hibernate update timestamp. |
-
 ### `transaction_db.idempotency_records`
 
 | Field | Type | Notes |
@@ -746,9 +681,20 @@ There is no derivation between them — `reference_number` is an independent ran
 | `id` | String UUID | Primary key generated by JPA. |
 | `idempotency_key` | String | Unique. Client-provided key from the `Idempotency-Key` header. |
 | `transaction_id` | String | Transaction executed for this key (null while in progress). |
-| `request_hash` | String | Hash of the request body so a key cannot be reused with a different request. |
+| `request_hash` | String | Fingerprint of the request — `senderAccountNumber|receiverAccountNumber|amount|description`, e.g. `000012345678|000087654321|5000|Rent`. Saves what the key was used for. |
 | `status` | Enum string | `IN_PROGRESS`, `COMPLETED`. |
 | `created_at` | DateTime | Used for the 24-hour key TTL. |
+
+**Why `request_hash` exists (plain English):** the idempotency key identifies the **attempt**; the hash identifies the **exact request**. When a key is used for the first time, this fingerprint is stored with it. When the same key comes back, the new request's fingerprint is compared with the stored one:
+
+| Key comes back with... | Hash check | Result |
+|---|---|---|
+| Same request (`A\|B\|5000`) | Matches | Duplicate retry → return the original result; money moves once |
+| Different request (`A\|B\|100000`) | Does not match | Rejected — "key already used for a different request"; the client must use a fresh key |
+
+Without this check, a client could take a successful key and attach it to a different, larger transfer. The system would see "key already used" and return the old result while the new transfer silently never executed. The hash keeps one key tied to one exact request forever.
+
+Note: the hash covers sender, receiver, amount, and description — but not the external rail fields (`rail` / `beneficiaryBank`).
 
 ---
 
@@ -840,9 +786,12 @@ Base path:
 | Method | Endpoint | Purpose | Request | Main response |
 |---|---|---|---|---|
 | `POST` | `/api/v1/transactions/transfer` | Transfer money | JSON body | `TransactionResponse` |
+| `POST` | `/api/v1/transactions/inbound-credit` | Record an external credit received via the rail (called by Interbank Service) | JSON body | `TransactionResponse` |
 | `GET` | `/api/v1/transactions/{transactionId}` | Get transaction by ID | Path variable | `TransactionResponse` |
-| `GET` | `/api/v1/transactions/account/{accountNumber}` | Get sender transaction history | Path variable | List of transactions |
+| `GET` | `/api/v1/transactions/account/{accountNumber}` | Get transaction history — money sent and money received | Path variable | List of transactions |
 | `POST` | `/api/v1/transactions/{transactionId}/verify?otp={otp}` | Verify OTP | Query parameter | Updated transaction |
+
+> **Why two endpoints instead of one?** Because each microservice owns its own database. `transaction_db` belongs to Transaction Service — the interbank service has no access to it. So it can't write the ledger row itself; it has to ask Transaction Service to do it, through its API. That's the whole point of microservices: no shared database, communicate through APIs. (`POST /api/v1/transactions/inbound-credit` is that service-to-service call; `POST /api/v1/interbank/inbound-credit` is the public door for money arriving from another bank.)
 
 #### `POST /api/v1/transactions/transfer`
 
@@ -897,10 +846,8 @@ Base path:
 
 | Method | Endpoint | Purpose | Request | Main response |
 |---|---|---|---|---|
-| `POST` | `/api/v1/interbank/inbound-credit` | Simulate an inbound credit from another bank | JSON body | `InboundCreditResponse` |
-| `GET` | `/api/v1/interbank/credits/{accountNumber}` | Inbound credit history for an account | Path variable | List of credits |
-| `POST` | `/api/v1/interbank/outbound-transfer` | Simulate sending a payment to another bank | JSON body | `OutboundTransferResponse` |
-| `GET` | `/api/v1/interbank/outbound/{accountNumber}` | Outbound transfer history for an account | Path variable | List of transfers |
+| `POST` | `/api/v1/interbank/inbound-credit` | Simulate an inbound credit from another bank (credits the account; the completed credit is recorded in the bank's transactions ledger) | JSON body | `InboundCreditResponse` |
+| `POST` | `/api/v1/interbank/outbound-transfer` | Simulate sending a payment to another bank (returns a UTR; the bank-side debit is already recorded) | JSON body | `OutboundTransferResponse` |
 
 #### `POST /api/v1/interbank/inbound-credit`
 
@@ -934,7 +881,7 @@ Response (`status: COMPLETED`):
 }
 ```
 
-If the account cannot be credited, `status` is `FAILED` and `failureReason` explains why.
+If the account cannot be credited, `status` is `FAILED` and `failureReason` explains why. On success the account balance is updated and Transaction Service records a `COMPLETED` `PAYMENT` row in the bank's `transactions` ledger with the UTR as its reference number — via its service-to-service `POST /api/v1/transactions/inbound-credit` endpoint. The rail itself stores nothing.
 
 #### `POST /api/v1/interbank/outbound-transfer`
 
@@ -1102,7 +1049,6 @@ Defined in `frontend/src/services/api.js`.
 | `getTransactionHistory(accountNumber)` | `GET /transactions/account/{accountNumber}` |
 | `verifyOTP(transactionId, otp)` | `POST /transactions/{transactionId}/verify?otp={otp}` |
 | `submitInboundCredit(data)` | `POST /interbank/inbound-credit` |
-| `getInboundCredits(accountNumber)` | `GET /interbank/credits/{accountNumber}` |
 
 ### UI behavior
 
@@ -1195,14 +1141,11 @@ DigitalBankingSystem/
 │       │   ├── service/InboundCreditService.java
 │       │   ├── service/OutboundTransferService.java
 │       │   ├── client/AccountServiceClient.java
+│       │   ├── client/TransactionServiceClient.java
 │       │   ├── config/CorsConfig.java
-│       │   ├── model/InboundCredit.java
-│       │   ├── model/OutboundTransfer.java
 │       │   ├── model/Rail.java
 │       │   ├── model/InboundCreditStatus.java
 │       │   ├── model/OutboundTransferStatus.java
-│       │   ├── repository/InboundCreditRepository.java
-│       │   ├── repository/OutboundTransferRepository.java
 │       │   ├── util/UtrGenerator.java
 │       │   └── dto/
 │       └── resources/application.yml
@@ -1266,8 +1209,8 @@ Databases created automatically:
 | Service | Database |
 |---|---|
 | Account Service | `account_db` |
-| Transaction Service | `transaction_db` |
-| Interbank Service | `interbank_db` |
+| Transaction Service | `transaction_db` — the single bank ledger; every completed credit/debit, internal or external |
+| Interbank Service | none (simulates the rail; keeps no records) |
 
 No external credentials are required. The Interbank Service simulates the inbound credit rail locally, so there are no gateway keys, webhook secrets, or third-party accounts to configure.
 
@@ -1450,9 +1393,9 @@ For production-style deployment, add:
 - Any caller can access local APIs if they know the endpoint.
 - The direct account credit endpoint is still exposed (used by the Interbank Service internally); it should be hidden behind service-level authorization.
 - Notification Service logs alerts instead of sending email, SMS, or push notifications.
-- Transaction history repository fetches by sender account number only.
+- Transaction history shows the bank's own ledger for an account: money sent (sender) and money received (receiver) from the `transactions` table, including external payments (rail and UTR are stored on the row).
 - Cross-service consistency relies on custom compensation logic, not distributed transactions.
-- Idempotency is implemented for transfers; the inbound credit endpoint and other services do not yet use keys.
+- Idempotency is implemented for transfers; the inbound credit recording endpoint does not yet use keys.
 - External (outbound) transfers are simulated locally by the Interbank Service; there is no real NPCI/RBI connectivity.
 - No retry, dead-letter topic, or idempotency layer is implemented for Kafka consumers.
 - No database migrations are included; schema is managed by Hibernate `ddl-auto: update`.
@@ -1467,7 +1410,7 @@ For production-style deployment, add:
 - Add Spring Security with JWT-based user authentication.
 - Add role-based access for admin, customer, and support users.
 - Hide internal debit and credit endpoints behind service-level authorization.
-- Add idempotency keys to the inbound credit endpoint and other money-moving APIs.
+- Add idempotency keys to the inbound credit recording endpoint and other money-moving APIs.
 - Add consumer-side idempotency plus Kafka retry and dead-letter topics.
 - Integrate a real NPCI / RBI sandbox or test API for UPI, IMPS, or NEFT instead of the local simulation.
 - Add optimistic locking or database-level locking for balance updates.
@@ -1490,7 +1433,7 @@ For production-style deployment, add:
 
 ### 30-second project explanation
 
-> Digital Banking System is a full-stack microservices banking application built with React, Spring Boot, MySQL, Redis, and Kafka. The React frontend sends requests to a Spring Cloud API Gateway. Account Service manages accounts and balances, Transaction Service handles transfers with saga compensation and idempotency keys, Fraud Detection Service checks risky transactions asynchronously, Interbank Service simulates the UPI/IMPS/NEFT rails in both directions — receiving credits from other banks and sending transfers to them, with UTR references — and Notification Service consumes Kafka events to log alerts. Redis is used for OTP expiry, fraud counters, and rate limiting, while MySQL stores account, transaction, inbound credit, outbound transfer, and idempotency data.
+> Digital Banking System is a full-stack microservices banking application built with React, Spring Boot, MySQL, Redis, and Kafka. The React frontend sends requests to a Spring Cloud API Gateway. Account Service manages accounts and balances, Transaction Service handles transfers with saga compensation and idempotency keys, Fraud Detection Service checks risky transactions asynchronously, Interbank Service simulates the UPI/IMPS/NEFT rails in both directions — receiving credits from other banks and sending transfers to them, with UTR references — and Notification Service consumes Kafka events to log alerts. Redis is used for OTP expiry, fraud counters, and rate limiting, while MySQL stores accounts and the bank's single transaction ledger — every completed credit or debit, internal or external, with the rail UTR as its reference — plus idempotency records. The rail itself keeps no data.
 
 ### Important design decisions to explain
 

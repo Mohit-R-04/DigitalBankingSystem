@@ -1,5 +1,6 @@
 package com.banking.transactionservice.controller;
 
+import com.banking.transactionservice.dto.InboundCreditRecordRequest;
 import com.banking.transactionservice.dto.TransactionResponse;
 import com.banking.transactionservice.dto.TransferRequest;
 import com.banking.transactionservice.service.TransactionService;
@@ -46,6 +47,16 @@ public class TransactionController {
                 transactionService.getTransactionHistory(accountNumber));
     }
 
+
+    // Record an external credit received via a payment rail. Called by the
+    // Interbank Service after the account is credited; every completed
+    // credit/debit is a ledger entry in the bank's transactions table.
+    @PostMapping("/inbound-credit")
+    public ResponseEntity<TransactionResponse> recordInboundCredit(
+            @Valid @RequestBody InboundCreditRecordRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(transactionService.recordInboundCredit(request));
+    }
 
     @PostMapping("/{transactionId}/verify")
     public ResponseEntity<TransactionResponse> verifyTransaction(

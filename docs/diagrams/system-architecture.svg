@@ -68,9 +68,9 @@
 
   <rect x="1310" y="405" width="390" height="138" class="node" fill="#fee2e2" stroke="#dc2626"/>
   <text x="1505" y="442" text-anchor="middle" class="name">Interbank Service :8083</text>
-  <text x="1505" y="470" text-anchor="middle" class="meta">Inbound credit rail (UPI | IMPS | NEFT)</text>
-  <text x="1505" y="496" text-anchor="middle" class="tiny">Feign credit to Account Service on inbound credit</text>
-  <text x="1505" y="519" text-anchor="middle" class="tiny">Produces inbound.credit.received and inbound.credit.failed</text>
+  <text x="1505" y="470" text-anchor="middle" class="meta">Simulates the rail (UPI | IMPS | NEFT)</text>
+  <text x="1505" y="496" text-anchor="middle" class="tiny">Feign credit to Account Service | record ledger entry to Transaction Service</text>
+  <text x="1505" y="519" text-anchor="middle" class="tiny">Produces inbound.credit.* | outbound.transfer.sent | no storage</text>
 
   <!-- Gateway routes: separate vertical branches -->
   <path d="M880 280V342H295V405" class="http"/>
@@ -107,16 +107,8 @@
     <text x="175" y="43" text-anchor="middle" class="dbName">account_db.accounts</text>
     <text x="175" y="64" text-anchor="middle" class="dbMeta">MySQL 8 | service-owned schema</text>
   </g>
-  <g transform="translate(1105 570)">
-    <ellipse cx="175" cy="13" rx="175" ry="13" class="dbTop"/>
-    <rect x="0" y="13" width="350" height="57" class="dbBody"/>
-    <ellipse cx="175" cy="70" rx="175" ry="13" class="dbBody"/>
-    <text x="175" y="43" text-anchor="middle" class="dbName">interbank_db.inbound_credits</text>
-    <text x="175" y="64" text-anchor="middle" class="dbMeta">MySQL 8 | service-owned schema</text>
-  </g>
   <path d="M295 543V570" class="store"/>
   <path d="M900 543V570" class="store"/>
-  <path d="M1455 543V555H1280V570" class="store"/>
 
   <!-- Kafka bus -->
   <rect x="45" y="710" width="1710" height="165" class="lane"/>
