@@ -26,7 +26,11 @@ export const getTransactionHistory = (accountNumber) =>
 export const verifyOTP = (transactionId, otp) =>
   api.post(`/transactions/${transactionId}/verify?otp=${otp}`);
 
-// Interbank Service (inbound credit rail simulation)
-export const submitInboundCredit = (data) => api.post('/interbank/inbound-credit', data);
+// Interbank Service (inbound credit rail simulation). The Interbank
+// Service is internal now (outbound transfers arrive via Kafka), so the
+// inbound-credit simulator is called directly on :8083, not through the
+// API gateway.
+export const submitInboundCredit = (data) =>
+  api.post('http://localhost:8083/api/v1/interbank/inbound-credit', data);
 
 export default api;

@@ -113,7 +113,7 @@ public class AccountService {
     }
 
 
-    @KafkaListener(topics = "transaction.credit.requested")
+    @KafkaListener(topics = "intrabank.transfer.requested")
     public void consumeCreditRequested(
             @Payload Map<String, Object> payload) {
         String transactionId = (String) payload.get("transactionId");

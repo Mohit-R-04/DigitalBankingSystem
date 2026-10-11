@@ -131,5 +131,25 @@ public class TransactionEventConsumer {
         }
     }
 
+    @KafkaListener(topics = "interbank.transfer.completed")
+    public void consumeInterbankTransferCompleted(
+            @Payload Map<String, Object> payload){
+
+        try{
+
+            String transactionId =  (String) payload.get("transactionId");
+            String utr =  (String) payload.get("utr");
+            String status =  (String) payload.get("status");
+            String failureReason =  (String) payload.get("failureReason");
+            log.info("Interbank transfer ack - transaction: {} status: {} UTR: {}",
+                    transactionId, status, utr);
+            transactionService.handleInterbankTransferCompleted(
+                    transactionId, utr, status, failureReason);
+        }
+        catch(Exception e){
+            log.error("Error handling interbank transfer ack: {}", e.getMessage());
+        }
+    }
+
 
 }

@@ -1,10 +1,7 @@
 package com.banking.transactionservice.service;
 
 import com.banking.transactionservice.client.AccountServiceClient;
-import com.banking.transactionservice.client.InterbankServiceClient;
 import com.banking.transactionservice.dto.InboundCreditRecordRequest;
-import com.banking.transactionservice.dto.OutboundTransferRequest;
-import com.banking.transactionservice.dto.OutboundTransferResponse;
 import com.banking.transactionservice.dto.TransactionResponse;
 import com.banking.transactionservice.dto.TransferRequest;
 import com.banking.transactionservice.model.IdempotencyRecord;
@@ -39,7 +36,6 @@ public class TransactionService {
 
     private final TransactionRepository transactionRepository;
     private final AccountServiceClient accountServiceClient;
-    private final InterbankServiceClient interbankServiceClient;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final IdempotencyRecordRepository idempotencyRecordRepository;
     private final RedisTemplate<String, String> redisTemplate;
@@ -50,7 +46,9 @@ public class TransactionService {
     private static final String TRANSACTION_COMPLETED_TOPIC = "transaction.completed";
     private static final String TRANSACTION_REFUNDED_TOPIC = "transaction.refunded";
     private static final String FRAUD_DETECTED_TOPIC = "fraud.detected";
-    private static final String TRANSACTION_CREDIT_REQUESTED_TOPIC = "transaction.credit.requested";
+    private static final String INTRABANK_TRANSFER_REQUESTED_TOPIC = "intrabank.transfer.requested";
+    private static final String INTERBANK_TRANSFER_REQUESTED_TOPIC = "interbank.transfer.requested";
+    private static final String INTERBANK_TRANSFER_COMPLETED_TOPIC = "interbank.transfer.completed";
 
     @Transactional
     public TransactionResponse transfer(TransferRequest request, String idempotencyKey) {
@@ -279,51 +277,69 @@ public class TransactionService {
         creditRequest.put("amount", transaction.getAmount());
         creditRequest.put("description", transaction.getDescription());
 
-        kafkaTemplate.send(TRANSACTION_CREDIT_REQUESTED_TOPIC,
+        kafkaTemplate.send(INTRABANK_TRANSFER_REQUESTED_TOPIC,
                 transaction.getId(), creditRequest);
-        log.info("transaction.credit.requested published - waiting for credit ack: {}",
+        log.info("intrabank.transfer.requested published - waiting for credit ack: {}",
                 transaction.getId());
     }
 
     /**
-     * SAGA STEP 3 (external): hand the payment to the interbank rail. The
-     * sender was already debited; the rail routes the message to the
-     * beneficiary's bank and returns a UTR. Only then is the transaction
-     * marked COMPLETED. If the rail rejects the payment, the saga
-     * compensates by refunding the sender.
+     * SAGA STEP 3 (external): hand the payment to the interbank rail over
+     * Kafka. The sender was already debited; the event is published on
+     * interbank.transfer.requested and the Interbank Service (the simulated
+     * switch) picks it up, mints a UTR and replies on
+     * interbank.transfer.completed. Only then is the transaction marked
+     * COMPLETED. If the rail rejects the payment, the saga compensates by
+     * refunding the sender.
      */
     private void sendExternalTransfer(Transaction transaction) {
         log.info("SAGA STEP 3 - external transfer via {} for transaction: {}",
                 transaction.getRail(), transaction.getId());
 
-        try {
-            OutboundTransferRequest request = new OutboundTransferRequest(
-                    transaction.getSenderAccountNumber(),
-                    transaction.getReceiverAccountNumber(),
-                    transaction.getBeneficiaryBank(),
-                    transaction.getBeneficiaryIfsc(),
-                    transaction.getAmount(),
-                    transaction.getRail(),
-                    transaction.getDescription());
+        Map<String, Object> event = new HashMap<>();
+        event.put("transactionId", transaction.getId());
+        event.put("senderAccountNumber", transaction.getSenderAccountNumber());
+        event.put("beneficiaryAccountNumber", transaction.getReceiverAccountNumber());
+        event.put("beneficiaryBank", transaction.getBeneficiaryBank());
+        event.put("beneficiaryIfsc", transaction.getBeneficiaryIfsc());
+        event.put("amount", transaction.getAmount());
+        event.put("rail", transaction.getRail());
+        event.put("description", transaction.getDescription());
 
-            OutboundTransferResponse response =
-                    interbankServiceClient.sendOutboundTransfer(request);
+        kafkaTemplate.send(INTERBANK_TRANSFER_REQUESTED_TOPIC,
+                transaction.getId(), event);
+        log.info("interbank.transfer.requested published - waiting for UTR: {}",
+                transaction.getId());
+    }
 
-            if ("COMPLETED".equalsIgnoreCase(response.getStatus())) {
-                transaction.setReferenceNumber(response.getUtr());
-                transactionRepository.save(transaction);
-                log.info("External transfer sent - UTR: {} transaction: {}",
-                        response.getUtr(), transaction.getId());
-                markCompleted(transaction.getId());
-            } else {
-                compensateTransaction(transaction,
-                        "External transfer failed - " + response.getFailureReason());
-            }
-        } catch (Exception e) {
-            log.error("External transfer failed for transaction: {} - compensating",
-                    transaction.getId(), e);
+    /**
+     * Interbank Service replied on interbank.transfer.completed after
+     * simulating the rail: a COMPLETED status carries the UTR and means the
+     * payment reached the beneficiary bank (mark COMPLETED); any other
+     * status means the rail rejected it (refund the sender).
+     */
+    public void handleInterbankTransferCompleted(String transactionId, String utr,
+                                                 String status, String failureReason) {
+        Transaction transaction = transactionRepository.findById(transactionId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Transaction not found " + transactionId));
+
+        if (transaction.getStatus() != TransactionStatus.PROCESSING
+                && transaction.getStatus() != TransactionStatus.PENDING_VERIFICATION) {
+            log.warn("Transaction {} not awaiting rail ack - skipping", transactionId);
+            return;
+        }
+
+        if ("COMPLETED".equalsIgnoreCase(status)) {
+            transaction.setReferenceNumber(utr);
+            transactionRepository.save(transaction);
+            log.info("External transfer delivered - UTR: {} transaction: {}",
+                    utr, transactionId);
+            markCompleted(transactionId);
+        } else {
             compensateTransaction(transaction,
-                    "External transfer failed - " + e.getMessage());
+                    "External transfer failed - "
+                            + (failureReason == null ? "unknown" : failureReason));
         }
     }
 

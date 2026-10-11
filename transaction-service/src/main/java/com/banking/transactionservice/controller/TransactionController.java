@@ -48,7 +48,7 @@ public class TransactionController {
     }
 
 
-    // Record an external credit received via a payment rail. Called by the
+    // Record an external credit received via a payment rail. Called by the (out to in credit)
     // Interbank Service after the account is credited; every completed
     // credit/debit is a ledger entry in the bank's transactions table.
     @PostMapping("/inbound-credit")

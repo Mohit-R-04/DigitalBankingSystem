@@ -28,6 +28,7 @@ The system does not keep all banking logic inside one monolithic backend. Each c
 - [Failure handling](#failure-handling)
 - [Current limitations](#current-limitations)
 - [Future improvements](#future-improvements)
+- [Improved architecture (authentication layer)](#improved-architecture-authentication-layer)
 - [Placement and interview guide](#placement-and-interview-guide)
 
 ---
@@ -60,7 +61,7 @@ The Create Account page collects holder name, email, phone number, account type,
 
 The Transfer page accepts sender account number, receiver account number, transfer amount, and description. The backend deducts the sender balance, stores the transaction, runs fraud checks, and either completes the transaction or requires OTP verification.
 
-For transfers to another bank, the page has an optional "transfer to another bank" toggle that adds a payment rail (UPI / IMPS / NEFT) and the beneficiary bank name. The money is then routed through the Interbank Service, which returns a Unique Transaction Reference (UTR) — exactly like a real NEFT/IMPS/UPI debit.
+For transfers to another bank, the page has an optional "transfer to another bank" toggle that adds a payment rail (UPI / IMPS / NEFT) and the beneficiary bank name. After the fraud checks, the transfer is published on `interbank.transfer.requested` and routed through the Interbank Service via Kafka, which returns a Unique Transaction Reference (UTR) — exactly like a real NEFT/IMPS/UPI debit.
 
 ### OTP verification
 
@@ -159,7 +160,7 @@ This project solves these problems using separate services and a saga-like trans
 | API Gateway | `8080` | Backend entry point, routing, CORS, rate limiting |
 | Account Service | `8081` | Account creation, balance, debit, credit, blocking |
 | Transaction Service | `8082` | Transfers, OTP verification, transaction history, compensation |
-| Interbank Service | `8083` | Interbank rail simulation - inbound credits and outbound transfers |
+| Interbank Service | `8083` | Interbank rail simulation (internal - outbound transfers arrive via Kafka; exposes the inbound credit simulator) |
 | Fraud Detection Service | `8084` | Kafka-based fraud checks |
 | Notification Service | `8085` | Kafka-based notification logging |
 | MySQL | `3306` | Persistent databases |
@@ -177,7 +178,6 @@ flowchart LR
 
     G -->|/api/v1/accounts/**| A[Account Service\nPort 8081]
     G -->|/api/v1/transactions/**| T[Transaction Service\nPort 8082]
-    G -->|/api/v1/interbank/**| I[Interbank Service\nPort 8083]
 
     A --> AD[(MySQL\naccount_db)]
     T --> TD[(MySQL\ntransaction_db)]
@@ -229,7 +229,7 @@ Arrow labels show the direction of events; the exact topic each service produces
 - Creates accounts and generates account numbers.
 - Deducts and credits balances.
 - Blocks suspicious or manually blocked accounts.
-- Credits receivers on `transaction.credit.requested` and acknowledges via `transaction.credited` / `transaction.credit.failed`.
+- Credits receivers on `intrabank.transfer.requested` and acknowledges via `transaction.credited` / `transaction.credit.failed`.
 - Blocks sender accounts after fraud events.
 
 #### Transaction Service
@@ -253,7 +253,7 @@ Arrow labels show the direction of events; the exact topic each service produces
 
 - Simulates the interbank switch (NPCI / RBI / SWIFT) for both directions of the rail.
 - **Inbound**: receives a credit message from another bank, validates it, posts it to the beneficiary account with a Unique Transaction Reference (UTR).
-- **Outbound**: routes a payment message to the beneficiary's bank and returns a Unique Transaction Reference (UTR) (the sender is debited by Transaction Service first).
+- **Outbound**: consumes `interbank.transfer.requested` from Kafka, routes a payment message to the beneficiary's bank, and returns a Unique Transaction Reference (UTR) via `interbank.transfer.completed` (the sender is debited by Transaction Service first).
 - Keeps no records of its own — every completed credit or debit is a ledger entry in the bank's `transactions` table, carrying the UTR as its reference.
 - Publishes inbound credit received/failed and outbound transfer sent events.
 - Relies on real-world payment rails (UPI, IMPS, NEFT, SWIFT) — the systems that actually move money between banks. See section 6 for how they work. A bank does not need a gateway layer: it is itself a participant on those rails.
@@ -337,7 +337,7 @@ This is a development simulation endpoint used to seed balances. It is separate 
 
 ```text
 Another bank sends money through the rail (UPI / IMPS / NEFT)
-    -> POST /api/v1/interbank/inbound-credit  (simulates the switch delivering the credit)
+    -> POST http://localhost:8083/api/v1/interbank/inbound-credit  (simulates the switch delivering the credit; direct to Interbank Service, not through the gateway)
     -> Interbank Service mints a Unique Transaction Reference (UTR) (e.g. NEFT20260821012345)
     -> Calls the account credit endpoint -> balance updated
     -> Asks Transaction Service to record the completed credit in the bank's
@@ -373,7 +373,7 @@ sequenceDiagram
     FR->>FR: Apply fraud rules
     FR->>K: fraud.check.clean
     K->>T: Consume clean result
-    T->>K: transaction.credit.requested
+    T->>K: intrabank.transfer.requested
     K->>A: Consume credit request
     A->>A: Credit receiver balance
     A->>K: transaction.credited (ack)
@@ -383,11 +383,11 @@ sequenceDiagram
     K->>N: Log debit and credit alerts
 ```
 
-The transaction is **not** marked `COMPLETED` when the fraud check passes. Transaction Service first publishes `transaction.credit.requested`; Account Service credits the receiver and replies with `transaction.credited`. Only after consuming that acknowledgment does Transaction Service set the status to `COMPLETED` and publish `transaction.completed` for notifications. If the credit fails, Account Service publishes `transaction.credit.failed` instead, and Transaction Service compensates by refunding the sender and marking the transaction `FLAGGED`.
+The transaction is **not** marked `COMPLETED` when the fraud check passes. Transaction Service first publishes `intrabank.transfer.requested`; Account Service credits the receiver and replies with `transaction.credited`. Only after consuming that acknowledgment does Transaction Service set the status to `COMPLETED` and publish `transaction.completed` for notifications. If the credit fails, Account Service publishes `transaction.credit.failed` instead, and Transaction Service compensates by refunding the sender and marking the transaction `FLAGGED`.
 
-For an **external transfer** (request carries `rail` / `beneficiaryBank`), the credit leg is different: instead of `transaction.credit.requested`, Transaction Service calls the Interbank Service outbound endpoint, which simulates the rail delivering the payment to the beneficiary's bank and returns a Unique Transaction Reference (UTR). The transaction is marked `COMPLETED` with the UTR as its reference. If the rail rejects the payment, the saga compensates by refunding the sender.
+For an **external transfer** (request carries `rail` / `beneficiaryBank`), everything up to the fraud check is identical to an internal transfer — debit, fraud rules, OTP step-up. The only difference is the final leg: instead of publishing `intrabank.transfer.requested`, Transaction Service publishes `interbank.transfer.requested` to Kafka. The Interbank Service consumes that topic, simulates the rail delivering the payment to the beneficiary's bank, mints a Unique Transaction Reference (UTR), and publishes `interbank.transfer.completed`. Transaction Service consumes that acknowledgment and marks the transaction `COMPLETED` with the UTR as its reference. If the rail rejects the payment, the saga compensates by refunding the sender.
 
-**One record — the bank's ledger.** Every credit or debit that completes — internal or external — is recorded in the bank's `transactions` table. For an external transfer, the sender is debited and the ledger entry created by Transaction Service before the rail is called; the Interbank Service (the simulated switch) only mints the **UTR** and returns it, and the bank stores it as the transaction's reference number — exactly how a real bank's posting carries the switch's UTR for reconciliation. The rail keeps no records of its own; conceptually it is the rail, not the bank.
+**One record — the bank's ledger.** Every credit or debit that completes — internal or external — is recorded in the bank's `transactions` table. For an external transfer, the sender is debited and the ledger entry created by Transaction Service before the transfer is dispatched to the rail via `interbank.transfer.requested`; the Interbank Service (the simulated switch) only mints the **UTR** and returns it, and the bank stores it as the transaction's reference number — exactly how a real bank's posting carries the switch's UTR for reconciliation. The rail keeps no records of its own; conceptually it is the rail, not the bank.
 
 Transfer request:
 
@@ -439,7 +439,7 @@ sequenceDiagram
     U->>T: POST /transactions/{id}/verify?otp=xxxxxx
     T->>R: Compare OTP
     alt OTP correct - internal transfer
-        T->>K: transaction.credit.requested
+        T->>K: intrabank.transfer.requested
         K->>A: Consume credit request
         A->>A: Credit receiver balance
         A->>K: transaction.credited (ack)
@@ -448,9 +448,11 @@ sequenceDiagram
         T->>K: transaction.completed
         K->>N: Debit and credit alerts
     else OTP correct - external transfer (to another bank)
-        T->>I: Feign: /interbank/outbound-transfer
-        I->>I: Mint UTR (Unique Transaction Reference), route payment
-        I-->>T: Return UTR
+        T->>K: interbank.transfer.requested (same as internal, but this topic)
+        K->>I: Interbank Service consumes the topic
+        I->>I: Mint UTR (Unique Transaction Reference), route payment via rail
+        I->>K: interbank.transfer.completed (UTR)
+        K->>T: Transaction Service consumes ack
         T->>T: Set UTR as reference, mark COMPLETED
         I->>K: outbound.transfer.sent
         K->>N: "₹X sent to bank via NEFT, UTR: ..."
@@ -505,7 +507,7 @@ POST /api/v1/transactions/transfer
 Idempotency-Key: 3f0e6c42-...
 ```
 
-How it works ([TransactionService.java:105](transaction-service/src/main/java/com/banking/transactionservice/service/TransactionService.java:105)):
+How it works ([TransactionService.java:446](transaction-service/src/main/java/com/banking/transactionservice/service/TransactionService.java:446)):
 
 1. The key is inserted into `idempotency_records` first (unique constraint) — the insert acts as a lock.
 2. A concurrent duplicate blocks on the insert, then fails with a constraint violation, and is served the original transaction's response. The money moves exactly once.
@@ -548,7 +550,7 @@ verification.required event
     -> user submits OTP
     -> compare OTP
         -> correct (internal): request receiver credit -> credited ack -> COMPLETED -> alerts
-        -> correct (external): interbank outbound -> UTR -> COMPLETED -> sent alert
+        -> correct (external): publish interbank.transfer.requested -> Interbank Service via Kafka -> UTR -> COMPLETED -> sent alert
         -> wrong: block account (fraud.detected) + refund sender + FLAGGED
         -> expired: refund sender + FLAGGED
 ```
@@ -557,8 +559,8 @@ OTP results:
 
 | Case | Behavior |
 |---|---|
-| Correct OTP - internal transfer | `transaction.credit.requested` is published; Account Service credits the receiver and acks with `transaction.credited`; only then the transaction becomes `COMPLETED`, `transaction.completed` is published, and debit/credit alerts are logged. |
-| Correct OTP - external transfer | Transaction Service calls the Interbank Service outbound endpoint; the rail returns a UTR (Unique Transaction Reference), which becomes the transaction reference; transaction becomes `COMPLETED` and the sender gets an `outbound.transfer.sent` alert ("sent to bank via NEFT, UTR: ..."). |
+| Correct OTP - internal transfer | `intrabank.transfer.requested` is published; Account Service credits the receiver and acks with `transaction.credited`; only then the transaction becomes `COMPLETED`, `transaction.completed` is published, and debit/credit alerts are logged. |
+| Correct OTP - external transfer | Transaction Service publishes `interbank.transfer.requested` to Kafka; the Interbank Service consumes the topic, simulates the rail, and publishes `interbank.transfer.completed` with a UTR (Unique Transaction Reference); Transaction Service consumes it, stores the UTR as the transaction reference, marks the transaction `COMPLETED`, and the sender gets an `outbound.transfer.sent` alert ("sent to bank via NEFT, UTR: ..."). |
 | Expired OTP | Sender is refunded, transaction becomes `FLAGGED`, `transaction.refunded` is published, and a refund alert is logged. |
 | Wrong OTP | `fraud.detected` is published - Account Service blocks the sender account and a blocked-account alert is logged; the sender is refunded, transaction becomes `FLAGGED`, and a refund alert is logged. |
 
@@ -670,7 +672,7 @@ Both fields are UUIDs but serve different roles:
 | Field | Role | Generated by | Used for |
 |---|---|---|---|
 | `id` | Internal system identifier (primary key). | Hibernate at insert time (`GenerationType.UUID`). | `findById` lookups, Kafka message keys, OTP Redis keys. Never shown to the user. |
-| `reference_number` | Customer-facing business reference. | Transaction Service at creation: `UUID.randomUUID()` ([TransactionService.java:63](transaction-service/src/main/java/com/banking/transactionservice/service/TransactionService.java:63)). | Receipts, customer support, reconciliation (UTR-style; UTR = Unique Transaction Reference). Returned in `TransactionResponse` and shown in the UI as "Ref". |
+| `reference_number` | Customer-facing business reference. | Transaction Service at creation: `UUID.randomUUID()` ([TransactionService.java:90](transaction-service/src/main/java/com/banking/transactionservice/service/TransactionService.java:90)). | Receipts, customer support, reconciliation (UTR-style; UTR = Unique Transaction Reference). Returned in `TransactionResponse` and shown in the UI as "Ref". |
 
 There is no derivation between them — `reference_number` is an independent random UUID, not computed from `id`, so a customer cannot derive one from the other.
 
@@ -720,9 +722,8 @@ The Vite development server proxies `/api` to `http://localhost:8080`.
 |---|---|---|---|
 | `/api/v1/accounts/**` | Account Service | `http://localhost:8081` | replenish 10, burst 20 |
 | `/api/v1/transactions/**` | Transaction Service | `http://localhost:8082` | replenish 10, burst 20 |
-| `/api/v1/interbank/**` | Interbank Service | `http://localhost:8083` | replenish 5, burst 10 |
 
-Rate limiting is implemented with Spring Cloud Gateway's `RequestRateLimiter` filter backed by a Redis token bucket ([application.yml:32-57](api-gateway/src/main/resources/application.yml:32)). The bucket is keyed by client IP via `KeyResolver` ([RateLimiterConfig.java:9](api-gateway/src/main/java/com/banking/apigateway/config/RateLimiterConfig.java:9)).
+Rate limiting is implemented with Spring Cloud Gateway's `RequestRateLimiter` filter backed by a Redis token bucket ([application.properties:16-28](api-gateway/src/main/resources/application.properties:16)). The bucket is keyed by client IP via `KeyResolver` ([RateLimiterConfig.java:9](api-gateway/src/main/java/com/banking/apigateway/config/RateLimiterConfig.java:9)).
 
 - **replenishRate** — tokens added to the bucket per second; the steady-state request rate a client can sustain.
 - **burstCapacity** — maximum bucket size; a client may fire up to `burstCapacity` requests at once when the bucket is full, after which the bucket refills at `replenishRate` per second.
@@ -791,7 +792,7 @@ Base path:
 | `GET` | `/api/v1/transactions/account/{accountNumber}` | Get transaction history — money sent and money received | Path variable | List of transactions |
 | `POST` | `/api/v1/transactions/{transactionId}/verify?otp={otp}` | Verify OTP | Query parameter | Updated transaction |
 
-> **Why two endpoints instead of one?** Because each microservice owns its own database. `transaction_db` belongs to Transaction Service — the interbank service has no access to it. So it can't write the ledger row itself; it has to ask Transaction Service to do it, through its API. That's the whole point of microservices: no shared database, communicate through APIs. (`POST /api/v1/transactions/inbound-credit` is that service-to-service call; `POST /api/v1/interbank/inbound-credit` is the public door for money arriving from another bank.)
+> **Why two endpoints instead of one?** Because each microservice owns its own database. `transaction_db` belongs to Transaction Service — the interbank service has no access to it. So it can't write the ledger row itself; it has to ask Transaction Service to do it, through its API. That's the whole point of microservices: no shared database, communicate through APIs. (`POST /api/v1/transactions/inbound-credit` is that service-to-service call; `POST /api/v1/interbank/inbound-credit` is the rail door for money arriving from another bank — called directly on the Interbank Service at `http://localhost:8083`, not through the API gateway, because the Interbank Service is internal.)
 
 #### `POST /api/v1/transactions/transfer`
 
@@ -846,10 +847,12 @@ Base path:
 
 | Method | Endpoint | Purpose | Request | Main response |
 |---|---|---|---|---|
-| `POST` | `/api/v1/interbank/inbound-credit` | Simulate an inbound credit from another bank (credits the account; the completed credit is recorded in the bank's transactions ledger) | JSON body | `InboundCreditResponse` |
-| `POST` | `/api/v1/interbank/outbound-transfer` | Simulate sending a payment to another bank (returns a UTR; the bank-side debit is already recorded) | JSON body | `OutboundTransferResponse` |
+| `POST` | `/api/v1/interbank/inbound-credit` | Simulate an inbound credit from another bank (credits the account; the completed credit is recorded in the bank's transactions ledger). Called directly on `http://localhost:8083` — not through the gateway | JSON body | `InboundCreditResponse` |
+| `POST` | `/api/v1/interbank/outbound-transfer` | Manual test hook for the rail simulation (returns a UTR; the bank-side debit is already recorded). The production path is `interbank.transfer.requested` via Kafka | JSON body | `OutboundTransferResponse` |
 
 #### `POST /api/v1/interbank/inbound-credit`
+
+Simulates the rail delivering money from another bank. Reachable directly at `http://localhost:8083/api/v1/interbank/inbound-credit` — the Interbank Service is not routed through the API gateway (it is an internal, Kafka-driven service).
 
 ```json
 {
@@ -885,7 +888,7 @@ If the account cannot be credited, `status` is `FAILED` and `failureReason` expl
 
 #### `POST /api/v1/interbank/outbound-transfer`
 
-Called by Transaction Service when a transfer targets another bank (the sender has already been debited). `rail` is `UPI`, `IMPS`, or `NEFT`.
+Manual test hook — in the production path the Interbank Service consumes `interbank.transfer.requested` from Kafka and executes the rail internally; this endpoint lets you trigger the same logic by hand (the sender has already been debited). `rail` is `UPI`, `IMPS`, or `NEFT`. Not routed through the API gateway.
 
 ```json
 {
@@ -951,7 +954,7 @@ Kafka enables asynchronous communication between services.
 | `fraud.check.clean` | Fraud Detection Service | Transaction Service | Continue a safe transaction (request receiver credit). |
 | `verification.required` | Fraud Detection Service | Transaction Service | Ask for OTP verification for a suspicious transaction. |
 | `transaction.otp.generated` | Transaction Service | Notification Service | Notify user that OTP was generated. |
-| `transaction.credit.requested` | Transaction Service | Account Service | Ask Account Service to credit the receiver account. |
+| `intrabank.transfer.requested` | Transaction Service | Account Service | Ask Account Service to credit the receiver account. |
 | `transaction.credited` | Account Service | Transaction Service | Acknowledge receiver credit succeeded; only then mark the transaction `COMPLETED`. |
 | `transaction.credit.failed` | Account Service | Transaction Service | Receiver credit failed; refund sender and mark transaction `FLAGGED`. |
 | `transaction.completed` | Transaction Service | Notification Service | Send debit/credit alerts after the receiver credit was acknowledged. |
@@ -960,6 +963,8 @@ Kafka enables asynchronous communication between services.
 | `inbound.credit.received` | Interbank Service | Notification Service | Notify user that money arrived via UPI/IMPS/NEFT with the Unique Transaction Reference (UTR). |
 | `inbound.credit.failed` | Interbank Service | Notification Service | Notify user that an inbound credit could not be posted. |
 | `outbound.transfer.sent` | Interbank Service | Notification Service | Notify sender that a payment to another bank was sent, with the Unique Transaction Reference (UTR). |
+| `interbank.transfer.requested` | Transaction Service | Interbank Service | External transfer cleared by fraud checks; Interbank Service consumes it and simulates the rail. |
+| `interbank.transfer.completed` | Interbank Service | Transaction Service | Rail delivered and UTR minted; Transaction Service marks the transfer `COMPLETED` with the UTR as reference. |
 
 ### Event-driven transfer summary
 
@@ -967,8 +972,9 @@ Kafka enables asynchronous communication between services.
 transfer request
     -> transaction.initiated
     -> fraud.check.clean OR verification.required
-    -> transaction.credit.requested
-    -> transaction.credited (mark COMPLETED) OR transaction.credit.failed (refund sender + FLAGGED)
+    -> intrabank.transfer.requested (internal) OR interbank.transfer.requested (external)
+    -> transaction.credited (internal) OR interbank.transfer.completed (external) -> mark COMPLETED
+    -> OR transaction.credit.failed / rail rejection -> refund sender + FLAGGED
     -> transaction.completed / transaction.refunded
     -> notification events consumed and logged
 ```
@@ -983,7 +989,7 @@ Kafka keeps services loosely coupled. Transaction Service does not directly call
 
 - **Topic** — a named channel, e.g. `transaction.initiated`. Producers publish to it, consumers read from it.
 - **Producer** — the service that publishes an event (e.g. Transaction Service publishes `fraud.detected`).
-- **Consumer group** — each service has its own group (`account-service-group`, `transaction-service-group`, `fraud-detection-group`, `notification-service-group`), so every interested service gets its own copy of every event.
+- **Consumer group** — each service has its own group (`account-service-group`, `transaction-service-group`, `fraud-detection-group`, `notification-service-group`, `interbank-service-group`), so every interested service gets its own copy of every event.
 - **Offset** — each group's bookmark, tracking "I have read up to this message". Groups advance their bookmarks independently.
 - **One event, many consumers** — publish-subscribe. `fraud.detected` is published once but delivered to two groups: Account Service (blocks the account) and Notification Service (logs the alert).
 - **Consuming never deletes** — a message stays in the topic after being read. It is removed only by retention (by default about 7 days, or once the topic exceeds its size limit), so a new group joining with `auto-offset-reset: earliest` can replay history from the start.
@@ -1048,7 +1054,7 @@ Defined in `frontend/src/services/api.js`.
 | `getTransaction(transactionId)` | `GET /transactions/{transactionId}` |
 | `getTransactionHistory(accountNumber)` | `GET /transactions/account/{accountNumber}` |
 | `verifyOTP(transactionId, otp)` | `POST /transactions/{transactionId}/verify?otp={otp}` |
-| `submitInboundCredit(data)` | `POST /interbank/inbound-credit` |
+| `submitInboundCredit(data)` | `POST http://localhost:8083/api/v1/interbank/inbound-credit` (direct to Interbank Service — not through the gateway) |
 
 ### UI behavior
 
@@ -1096,7 +1102,7 @@ DigitalBankingSystem/
 │       ├── java/com/banking/apigateway/
 │       │   ├── ApiGatewayApplication.java
 │       │   └── config/RateLimiterConfig.java
-│       └── resources/application.yml
+│       └── resources/application.properties
 ├── account-service/
 │   ├── pom.xml
 │   └── src/main/
@@ -1109,7 +1115,7 @@ DigitalBankingSystem/
 │       │   ├── repository/AccountRepository.java
 │       │   ├── dto/
 │       │   └── exception/GlobalExceptionHandler.java
-│       └── resources/application.yml
+│       └── resources/application.properties
 ├── transaction-service/
 │   ├── pom.xml
 │   └── src/main/
@@ -1122,7 +1128,7 @@ DigitalBankingSystem/
 │       │   ├── model/
 │       │   ├── repository/
 │       │   └── dto/
-│       └── resources/application.yml
+│       └── resources/application.properties
 ├── fraud-detection-service/
 │   ├── pom.xml
 │   └── src/main/
@@ -1132,7 +1138,7 @@ DigitalBankingSystem/
 │       │   ├── client/AccountServiceClient.java
 │       │   ├── config/RedisConfig.java
 │       │   └── model/FraudCheckResult.java
-│       └── resources/application.yml
+│       └── resources/application.properties
 ├── interbank-service/
 │   ├── pom.xml
 │   └── src/main/
@@ -1148,14 +1154,14 @@ DigitalBankingSystem/
 │       │   ├── model/OutboundTransferStatus.java
 │       │   ├── util/UtrGenerator.java
 │       │   └── dto/
-│       └── resources/application.yml
+│       └── resources/application.properties
 └── notification-service/
     ├── pom.xml
     └── src/main/
         ├── java/com/banking/notificationservice/
         │   ├── NotificationServiceApplication.java
         │   └── service/NotificationService.java
-        └── resources/application.yml
+        └── resources/application.properties
 ```
 
 ---
@@ -1407,25 +1413,148 @@ For production-style deployment, add:
 
 ## Future improvements
 
-- Add Spring Security with JWT-based user authentication.
-- Add role-based access for admin, customer, and support users.
+> Improvements are grouped by area. The two **security** items marked *designed* are fully specified in the [improved architecture](#improved-architecture-authentication-layer) section: a dedicated Auth Service issues signed JWTs, the API Gateway validates them on every request, and roles are carried as JWT claims.
+
+### Security and authentication
+
+- **JWT-based user authentication** — *designed*: Auth Service `:8086` issues signed JWTs, API Gateway `:8080` validates every request via its `SecurityWebFilterChain` (see [improved architecture](#improved-architecture-authentication-layer)).
+- **Role-based access for admin, customer, and support users** — *designed*: roles are carried as JWT claims and enforced from the forwarded `X-User-Role` header.
 - Hide internal debit and credit endpoints behind service-level authorization.
+- Add audit logs for balance-changing operations.
+
+### Reliability and data integrity
+
 - Add idempotency keys to the inbound credit recording endpoint and other money-moving APIs.
 - Add consumer-side idempotency plus Kafka retry and dead-letter topics.
-- Integrate a real NPCI / RBI sandbox or test API for UPI, IMPS, or NEFT instead of the local simulation.
 - Add optimistic locking or database-level locking for balance updates.
+- Enforce daily transaction limits.
+- Add account closure and reactivation workflows.
+
+### Integration and connectivity
+
+- Integrate a real NPCI / RBI sandbox or test API for UPI, IMPS, or NEFT instead of the local simulation.
 - Add service discovery using Eureka, Consul, or Kubernetes DNS.
+- Add real notification channels through email, SMS, or push.
+- Add transaction history for receiver accounts as well as sender accounts.
+
+### Developer experience and operations
+
 - Add API documentation with OpenAPI/Swagger.
 - Add Flyway or Liquibase migrations.
 - Add Testcontainers integration tests for MySQL, Kafka, and Redis.
 - Add end-to-end tests for frontend workflows.
 - Add centralized logging and tracing with OpenTelemetry.
 - Add metrics dashboards for service health, latency, and Kafka lag.
-- Add real notification channels through email, SMS, or push.
-- Add transaction history for receiver accounts as well as sender accounts.
-- Add audit logs for balance-changing operations.
-- Add daily transaction limit enforcement.
-- Add account closure and reactivation workflows.
+
+---
+
+## Improved architecture (authentication layer)
+
+The current system has no authentication — any caller who knows an endpoint can use it. The improved version adds a dedicated Auth Service that issues signed JWTs and moves JWT validation into the API Gateway, so downstream services stay stateless and trust the identity headers the gateway forwards.
+
+```mermaid
+flowchart LR
+    U[User / Browser] --> F[React frontend\nPort 3000]
+    F -->|REST through Vite proxy + Bearer JWT| G[API Gateway\nPort 8080]
+
+    G -->|/api/v1/auth/** whitelisted| AUTH[Auth Service\nPort 8086]
+    AUTH -->|issues signed JWT| F
+    G -->|/api/v1/accounts/**| A[Account Service\nPort 8081]
+    G -->|/api/v1/transactions/**| T[Transaction Service\nPort 8082]
+
+    AUTH --> AU[(MySQL\nauth_db)]
+    A --> AD[(MySQL\naccount_db)]
+    T --> TD[(MySQL\ntransaction_db)]
+
+    T -->|OpenFeign debit/credit/balance| A
+    I -->|OpenFeign credit| A
+    FR[Fraud Detection Service\nPort 8084] -->|OpenFeign balance| A
+
+    G --> R[(Redis)]
+    T --> R
+    FR --> R
+
+    T -->|publishes transfer / fraud / OTP events| K[(Kafka)]
+    FR -->|publishes fraud results| K
+    I -->|publishes rail events| K
+    K -->|consumes credit requests + fraud blocks| A
+    K -->|consumes fraud results + credit acks| T
+    K -->|consumes new transfers| FR
+    K -->|consumes alert events| N[Notification Service\nPort 8085]
+```
+
+The authentication additions are the `/api/v1/auth/**` route, the signed JWT returned to the frontend, and the `X-User-Id` / `X-User-Role` headers the gateway forwards to the account and transaction services on every authenticated request.
+
+**Where the JWT logic lives** — the JWT is *made* in one place and *checked* in another:
+
+| Task | Service |
+|---|---|
+| Issue / sign the JWT (login, register; BCrypt password check) | Auth Service `:8086` |
+| Validate the JWT on every request (signature + expiry, via the `SecurityWebFilterChain`) | API Gateway `:8080` |
+
+The Auth Service only creates tokens; the gateway is the only place that verifies them, so downstream services stay stateless and trust the forwarded `X-User-Id` / `X-User-Role` headers.
+
+**How JWT validation runs at the gateway** — the JWT filter sits *inside* the gateway's `SecurityWebFilterChain` and is the only place the token is read and verified:
+
+```text
+Request arrives
+  -> SecurityWebFilterChain starts (runs before routing)
+  -> whitelist check       (permit /api/v1/auth/**, /actuator/health, /actuator/info)
+  -> JWT filter            (Spring's BearerTokenAuthenticationFilter)
+       extract "Authorization: Bearer <jwt>" from the request header
+       validate signature + expiry (via JwtService)
+       set SecurityContext (userId + role)          -> 401 if missing / invalid / expired
+  -> authorization check   (request authenticated? role allowed?)
+  -> routed to Account / Transaction / Interbank
+```
+
+The whitelist lets login work without a token; every other request must pass the JWT filter, and its result feeds the authorization check that runs next. An invalid token is rejected with `401` before the request is routed to any service.
+
+### Authentication flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant F as React Frontend
+    participant G as API Gateway
+    participant A as Auth Service
+    participant D as auth_db (MySQL)
+    participant S as Account / Transaction Service
+
+    Note over U,S: 1. Login - JWT issuance
+    U->>F: Enter email and password
+    F->>G: POST /api/v1/auth/login
+    G->>A: Route request (whitelisted, no token needed)
+    A->>D: Look up user by email
+    D-->>A: User record with BCrypt hash
+    A->>A: Verify password, sign JWT (sub + role, expiry)
+    A-->>G: Return JWT
+    G-->>F: JWT in response
+    F->>F: Store JWT in localStorage
+
+    Note over U,S: 2. Authenticated request - JWT validation
+    U->>F: Open account details
+    F->>G: GET /api/v1/accounts/123 (Bearer JWT header)
+    G->>G: SecurityWebFilterChain: JWT filter verifies signature and expiry
+    alt Invalid or expired token
+        G-->>F: 401 Unauthorized
+        F->>F: Clear token, redirect to /login
+    else Valid token
+        G->>G: Set SecurityContext, add X-User-Id / X-User-Role headers
+        G->>S: Route request with identity headers
+        S-->>G: AccountResponse
+        G-->>F: Account data
+    end
+```
+
+### Implementation steps
+
+1. Scaffold `auth-service/` (port `8086`, database `auth_db`) with a `User` entity (email, BCrypt password hash, role, status) and `POST /api/v1/auth/register` + `POST /api/v1/auth/login`.
+2. Add `spring-boot-starter-security` and `jjwt` to the gateway; configure the `SecurityWebFilterChain` with a JWT authentication filter (Bearer token extraction + signature/expiry validation via a `ReactiveAuthenticationManager`) that whitelists `/api/v1/auth/**` and health endpoints and returns `401` otherwise.
+3. Add the `/api/v1/auth/**` gateway route in [api-gateway/src/main/resources/application.properties](api-gateway/src/main/resources/application.properties).
+4. Frontend: `AuthContext` + `Login` / `Register` pages, protected routes, and an Axios interceptor that attaches the token.
+5. The Interbank Service is no longer routed through the gateway — its inbound-credit simulator (`http://localhost:8083`, simulating another bank) should be protected with an API key; hide the internal `credit` / `deduct` account endpoints behind role checks.
+6. Store the JWT secret in an environment variable, use BCrypt for password hashing, and enforce HTTPS in production.
 
 ---
 
